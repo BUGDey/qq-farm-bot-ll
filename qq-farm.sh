@@ -13,7 +13,7 @@ trap 'rc=$?; if [[ ${BASH_SUBSHELL:-0} -eq 0 ]]; then printf "\033[31m[FAIL]\033
 # ./napcat/                 NapCat 安装包、配置、日志、状态（脚本所在目录内新建）
 # ./qq-miniapp-auth/        QQ 扫码授权服务（脚本所在目录内新建）
 #
-# NapCat 的两种安装方式都照 MK 工具（mk 2.19.0）的做法：
+# NapCat 的两种安装方式：
 #   Shell 安装：社区留档的 NapCat-Installer（naxida2333 / jizizr）rootless 安装到 ~/Napcat，
 #              执行前先用 sed 把 installer 里已失效的官方地址改成归档 release 地址，
 #              并预先放好 NapCat.Shell.zip 与 QQ 安装包，让它检测到同名文件就跳过自己的下载。
@@ -45,7 +45,7 @@ SOURCE_PID="$PROJECT_DIR/app_linux.pid"
 SOURCE_LOG="$PROJECT_DIR/app_linux.log"
 SOURCE_ERR="$PROJECT_DIR/app_linux.error.log"
 
-# ---- NapCat 版本与归档源（与 MK 工具一致；版本默认跟随 BUGDey/qq-farm-bot 的 v4.18.19）
+# ---- NapCat 版本与归档源（版本默认跟随 BUGDey/qq-farm-bot 的 v4.18.19）
 NAPCAT_VERSION="${NAPCAT_VERSION:-v4.18.19}"
 NAPCAT_ARCHIVE_REPO="${NAPCAT_ARCHIVE_REPO:-XingYunStar/NapCatQQ}"
 NAPCAT_INSTALLER_URL="${NAPCAT_INSTALLER_URL:-https://raw.githubusercontent.com/naxida2333/NapCat-Installer/main/script/install.sh}"
@@ -131,9 +131,9 @@ read_settings(){
   save_state
 }
 
-# ---------------------------------------------------------------- 下载（GitHub 加速前缀链，同 MK）
+# ---------------------------------------------------------------- 下载（GitHub 加速前缀链）
 
-# MK 工具内置的 GitHub 代理前缀，顺序即尝试顺序
+# GitHub 代理前缀，顺序即尝试顺序
 GH_PROXY_PREFIXES=(
   "https://ghfast.top/"
   "https://git.yylx.win/"
@@ -165,26 +165,31 @@ gh_url_variants(){
   printf '%s\n' "${out[@]}"
 }
 
+# 静默下载：不打印候选地址、不打印进度条，成功时什么都不输出（调用方自己打 ok）。
+# 某个源彻底失败才 warn 一行，并把 curl 的最后一句原因带上（只带一句，不刷屏）。
 fetch_to(){
   local dest="$1"; shift
-  local url attempt
+  local url attempt err reason
+  local errf="$dest.curlerr"
   for url in "$@"; do
     [[ -n "$url" ]] || continue
-    info "下载：$url"
-    # -sS：不要 curl 的进度条（那堆 % Total / % Received 只会刷屏），出错仍打印原因
-    # 每个候选地址内部再重试 2 次，避免加速站点偶发 5xx/掐断直接判死
+    # -fsS：不输出进度条，但把失败原因写进 errf（我们自己汇总成一行，不让 curl 刷屏）
     for attempt in 1 2 3; do
       if curl -fsSL -S --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 3600 \
-          -A 'Mozilla/5.0' -o "$dest.part" "$url"; then
+          -A 'Mozilla/5.0' -o "$dest.part" "$url" 2>"$errf"; then
         mv "$dest.part" "$dest"
+        rm -f "$errf"
         return 0
       fi
       [[ "$attempt" -lt 3 ]] && sleep 2
     done
     rm -f "$dest.part"
-    warn "该地址下载失败，尝试下一个"
+    reason="$(tail -n 1 "$errf" 2>/dev/null | tr -d '\r' || true)"
+    rm -f "$errf"
+    if [[ -n "$reason" ]]; then warn "源不可用，换下一个（$reason）：$url"
+    else warn "源不可用，换下一个：$url"; fi
   done
-  rm -f "$dest.part"
+  rm -f "$dest.part" "$errf"
   return 1
 }
 
@@ -349,7 +354,7 @@ fs.writeFileSync(p+".tmp",JSON.stringify(o,null,2)+"\n");fs.renameSync(p+".tmp",
   ok '旧版系统级 NapCat 已挪走（QQ 本体保留）'
 }
 
-# ---------------------------------------------------------------- NapCat Shell 安装（照 MK）
+# ---------------------------------------------------------------- NapCat Shell 安装
 
 # 下载社区留档的 NapCat-Installer，并把里面已失效的官方地址就地改掉
 napcat_get_installer(){
@@ -366,14 +371,16 @@ napcat_get_installer(){
     mapfile -t variants < <(gh_url_variants "$base")
     urls+=("${variants[@]}")
   done
-  local attempt
+  local attempt reason
+  local errf="$dest.curlerr"
   for try_url in "${urls[@]}"; do
     for attempt in 1 2; do
       # 不要写成 `head -n 1 | grep -q`：grep 命中即退出会让 head 收到 SIGPIPE，
       # 配合 pipefail 会把「下载成功」误判成失败。
-      if curl -fsSL --connect-timeout 20 --max-time 120 -o "$dest" "$try_url" \
+      if curl -fsSL -S --connect-timeout 20 --max-time 120 -o "$dest" "$try_url" 2>"$errf" \
           && [[ -s "$dest" ]] && [[ "$(head -c 2 "$dest")" == '#!' ]]; then
-        ok "NapCat 安装器下载完成：$try_url"
+        rm -f "$errf"
+        ok 'NapCat 安装器已就绪'
         printf '%s\n' "$dest"
         return 0
       fi
@@ -381,7 +388,9 @@ napcat_get_installer(){
     done
     rm -f "$dest"
   done
-  die "NapCat 安装器下载失败（已试两个留档仓库、全部加速前缀与直连）：$NAPCAT_INSTALLER_URL"
+  reason="$(tail -n 1 "$errf" 2>/dev/null | tr -d '\r' || true)"
+  rm -f "$errf"
+  die "NapCat 安装器下载失败（所有源都不可用）${reason:+：$reason}"
 }
 
 # installer 内部仍写死已失效的官方地址，执行前就地改成归档地址：
@@ -429,10 +438,10 @@ napcat_prepare_shell_zip(){
     local url="https://github.com/${NAPCAT_ARCHIVE_REPO}/releases/download/${NAPCAT_VERSION}/NapCat.Shell.zip"
     info "下载 NapCat Shell 包（${NAPCAT_VERSION}）…"
     if [[ -n "${NAPCAT_ZIP_URL:-}" ]]; then
-      fetch_to "$cache" "$NAPCAT_ZIP_URL" || die "NapCat Shell 包下载失败：$NAPCAT_ZIP_URL"
+      fetch_to "$cache" "$NAPCAT_ZIP_URL" || die "NapCat Shell 包下载失败（NAPCAT_ZIP_URL 指定的地址不可用）"
     else
       fetch_github "$cache" "$url" \
-        || die "NapCat Shell 包下载失败（可设置 NAPCAT_ZIP_URL 指定镜像）：$url"
+        || die "NapCat Shell 包下载失败（所有源都不可用，可设置 NAPCAT_ZIP_URL 指定镜像）"
     fi
     zip_looks_ok "$cache" || die 'NapCat.Shell.zip 校验失败（不是有效的 zip 包）'
     ok "NapCat Shell 包已缓存：$cache（$(du -h "$cache" | cut -f1)）"
@@ -443,7 +452,7 @@ napcat_prepare_shell_zip(){
   printf '%s\n' "$zip"
 }
 
-# 开放 6099（照 MK 的做法，尽力而为，失败不影响安装）
+# 开放 6099（尽力而为，失败不影响安装）
 open_port_6099(){
   local port="${1:-6099}"
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
@@ -478,7 +487,7 @@ install_napcat_shell(){
   require_root_ability
   read_settings
   cd_home
-  info '========== NapCat Shell 安装（照 MK 工具的做法）=========='
+  info '========== NapCat Shell 安装 =========='
   napcat_cleanup_old_install
   napcat_sudo_shim
   local installer zip
@@ -525,9 +534,9 @@ napcat_detect_qq(){
 
 cd_home(){ cd "$HOME" || die "无法进入 $HOME"; }
 
-# ---------------------------------------------------------------- NapCat Docker 安装（照 MK）
+# ---------------------------------------------------------------- NapCat Docker 安装
 
-# MK 工具内置的 Docker 镜像加速前缀
+# Docker 镜像加速前缀
 DOCKER_MIRROR_PREFIXES=(
   ""
   "docker.1ms.run/"
@@ -605,7 +614,7 @@ install_napcat_docker(){
   need docker
   docker info >/dev/null 2>&1 || die 'Docker 未运行或当前用户无权访问 Docker'
   read_settings
-  info '========== NapCat Docker 安装（照 MK 工具的做法）=========='
+  info '========== NapCat Docker 安装 =========='
   ensure_napcat_image
   mkdir -p "$NAPCAT_DIR/docker/config" "$NAPCAT_DIR/docker/plugins" "$NAPCAT_DIR/docker/QQ"
   docker rm -f "$NAPCAT_CONTAINER" >/dev/null 2>&1 || true
@@ -640,7 +649,7 @@ install_auth_service(){
     local tmp="$TMPDIR/qq-miniapp-auth.$$.tar.gz"
     local -a srcs=()
     mapfile -t srcs < <(auth_tarball_urls)
-    fetch_to "$tmp" "${srcs[@]}" || die 'qq-miniapp-auth 源码下载失败（已试 codeload / archive 两条地址与全部加速前缀，可用 AUTH_TARBALL_URL 指定）'
+    fetch_to "$tmp" "${srcs[@]}" || die 'qq-miniapp-auth 源码下载失败（所有源都不可用，可用 AUTH_TARBALL_URL 指定）'
     mkdir -p "$ROOT_DIR/.auth-extract"
     tar -xzf "$tmp" -C "$ROOT_DIR/.auth-extract"
     local extracted
@@ -1173,8 +1182,8 @@ menu(){
     printf '\n==== QQ Farm Bot + NapCat（脚本版本 %s）====\n' "$SCRIPT_VERSION"
     printf '1. 源码后台启动\n'
     printf '2. Docker 启动\n'
-    printf '3. 源码启动并全自动安装/配置 NapCat（Shell 安装，同 MK）与 qq-miniapp-auth\n'
-    printf '4. Docker 启动并全自动安装/配置 NapCat（Docker 安装，同 MK）与 qq-miniapp-auth\n'
+    printf '3. 源码启动并全自动安装/配置 NapCat（Shell 安装，不使用 Docker）与 qq-miniapp-auth\n'
+    printf '4. Docker 启动并全自动安装/配置 NapCat（Docker 安装）与 qq-miniapp-auth\n'
     printf '5. 重启 NapCat\n'
     printf '6. 重置管理员密码\n'
     printf '0. 退出\n'

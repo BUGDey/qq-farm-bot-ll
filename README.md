@@ -170,20 +170,20 @@ chmod +x ./qq-farm.sh
 | --- | --- |
 | `1` | 源码后台启动（`pnpm` 构建 Web/Core 后后台运行 `node core/client.js`） |
 | `2` | Docker Compose 启动 |
-| `3` | 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Shell 安装，同 MK 工具，不使用 Docker**） |
-| `4` | Docker 启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Docker 安装，同 MK 工具**） |
+| `3` | 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Shell 安装，不使用 Docker**） |
+| `4` | Docker 启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Docker 安装**） |
 | `5` | 重启 NapCat |
 | `6` | 重置管理员密码并打印账号/随机密码 |
 | `0` | 退出 |
 
 **NapCat 版本固定跟随上游 [BUGDey/qq-farm-bot](https://github.com/BUGDey/qq-farm-bot) 的 `v4.18.19`**，可用 `NAPCAT_VERSION` 覆盖。
 
-两种安装方式都照 MK 工具（`mk` 2.19.0，NapCat 菜单里的「Shell 直接安装」/「Docker 安装」）的做法，因为 NapNeko 官方的安装器与发布地址已经失效（`NapNeko/NapCatQQ` 的 release 资产为空、`NapNeko/NapCat-Installer` 仓库 404）：
+NapNeko 官方的安装器与发布地址已经失效（`NapNeko/NapCatQQ` 的 release 资产为空、`NapNeko/NapCat-Installer` 仓库 404），所以两条链路改用下面这些仍可用的源：
 
 - **Shell 安装**用社区留档的 [naxida2333/NapCat-Installer](https://github.com/naxida2333/NapCat-Installer)（备用 [jizizr](https://github.com/jizizr/NapCat-Installer)），以 `--docker n --cli n --proxy N --force` 非交互执行，rootless 装到 `~/Napcat`。执行前脚本会做三件事：① 用 `sed` 把 installer 里写死的失效地址改成归档仓库 `XingYunStar/NapCatQQ` 的固定 tag；② 预先下好 `NapCat.Shell.zip`；③ 预先下好 LinuxQQ 安装包并命名为 `QQ.deb`/`QQ.rpm`——installer 检测到同名文件就直接用本地包，从而绕开已失效的 `qqdl.gtimg.cn`。
 - **Docker 安装**直接拉 `mlikiowa/napcat-docker`，拉不动时依次换 `docker.1ms.run`、`docker.xuanyuan.me`、`docker.mybacc.com`、`dytt.online`、`lispy.org`、`docker.m.daocloud.io`、华为云等加速前缀，全部失败才用归档的离线 tar 包 `docker load` 导入并 `docker tag`。
 
-所有 GitHub 下载（NapCat 安装器、`NapCat.Shell.zip`、QQ 包、qq-miniapp-auth 源码、离线镜像 tar）都会走 10 个加速前缀的 fallback 链（`ghfast.top`、`git.yylx.win`、`gh-proxy.com`、`ghfile.geekertao.top`、`gh-proxy.net`、`j.1win.ggff.net`、`ghm.078465.xyz`、`gitproxy.127731.xyz`、`jiashu.1win.eu.org`、`github.tbedu.top`，最后直连），每个地址内部再重试 3 次；可用 `GH_PROXY_INDEX` 指定优先使用的加速站点。下载过程只打印一行 `[INFO] 下载：<地址>`（curl 用 `-sS`，不输出进度条），只有失败时才会看到 curl 的错误行。
+所有 GitHub 下载（NapCat 安装器、`NapCat.Shell.zip`、QQ 包、qq-miniapp-auth 源码、离线镜像 tar）都会走 10 个加速前缀的 fallback 链（`ghfast.top`、`git.yylx.win`、`gh-proxy.com`、`ghfile.geekertao.top`、`gh-proxy.net`、`j.1win.ggff.net`、`ghm.078465.xyz`、`gitproxy.127731.xyz`、`jiashu.1win.eu.org`、`github.tbedu.top`，最后直连），每个地址内部再重试 3 次；可用 `GH_PROXY_INDEX` 指定优先使用的加速站点。下载过程不打印候选地址、不打印 curl 进度条，成功只输出一行落地结果，只有某个源失败时才打印一行 `[WARN] 源不可用，换下一个：<地址>`。
 
 另外三类下载各有一套补充源：
 
