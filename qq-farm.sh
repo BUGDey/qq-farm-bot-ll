@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-16.8"
+SCRIPT_VERSION="2026-11-16.9"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -869,6 +869,75 @@ start_auth_service(){
   ok "qq-miniapp-auth 已后台启动，PID=$pid，日志：$log"
 }
 
+stop_auth_service(){
+  local pid_file="$AUTH_DIR/qq-miniapp-auth.pid"
+  local pid=''
+  if [[ -f "$pid_file" ]]; then
+    pid="$(tr -d '[:space:]' < "$pid_file" 2>/dev/null || true)"
+  fi
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    # npm start 会再套一层 node，整组一起结束
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file"
+  # 兜底：按命令行精确匹配本目录下的服务，不误杀别的 node 进程
+  pkill -TERM -f "$AUTH_DIR/start-all.js" 2>/dev/null || true
+  pkill -TERM -f "$AUTH_DIR/bridge.js" 2>/dev/null || true
+  pkill -TERM -f "$AUTH_DIR/server.js" 2>/dev/null || true
+  sleep 1
+  return 0
+}
+
+restart_auth_service(){
+  info '正在重启 qq-miniapp-auth（会清空卡住的扫码登录状态）…'
+  stop_auth_service
+  start_auth_service
+}
+
+# QQ 扫码登录卡在「工作流繁忙」时，内存里的单例工作流没释放，只能重启授权服务。
+# NapCat 侧还会残留 WebUI 的 QQLoginStatus 标志，一并让它重启 worker。
+fix_qq_login(){
+  load_state
+  local health
+  health="$(curl -fsS --max-time 3 "${API_ENDPOINT%/}/api/health" 2>/dev/null || true)"
+  if [[ -n "$health" ]]; then
+    if command -v node >/dev/null 2>&1; then
+      printf '%s' "$health" | node -e '
+let raw = "";
+process.stdin.on("data", d => raw += d).on("end", () => {
+  try {
+    const h = JSON.parse(raw);
+    if (h.workflowBusy) console.log(`[状态] 有扫码登录卡住：phase=${h.workflowPhase || "?"}`);
+    else console.log("[状态] 当前没有卡住的登录工作流");
+    if (h.logoutRecoveryRequired) console.log("[状态] 上一次 QQ 注销未完成，需要恢复");
+  } catch { console.log("[状态] 授权服务返回内容无法解析"); }
+});
+' >&2 || true
+    fi
+  else
+    warn "授权服务没有响应（$API_ENDPOINT），将直接重启它"
+  fi
+  restart_auth_service
+  # 清掉 NapCat WebUI 里残留的登录标志，否则新二维码可能仍被拒
+  if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
+    docker restart "$NAPCAT_CONTAINER" >/dev/null 2>&1 || true
+  elif command -v curl >/dev/null 2>&1; then
+    local token=''
+    local webui_cfg="${NAPCAT_ROOT:-$NAPCAT_DIR}/config/webui.json"
+    if [[ -f "$webui_cfg" ]]; then
+      token="$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).token||"")}catch{}' "$webui_cfg" 2>/dev/null || true)"
+    fi
+    if [[ -n "$token" ]]; then
+      curl -fsS --max-time 5 -X POST "http://127.0.0.1:6099/api/QQLogin/RestartNapCat" \
+        -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
+    fi
+  fi
+  ok 'QQ 扫码登录状态已重置，回到面板重新点「刷新二维码」即可'
+  report_panel_access 0
+}
+
 # ---------------------------------------------------------------- 插件安装
 
 install_napcat_plugin(){
@@ -1292,6 +1361,15 @@ source_running(){
   [[ "$cmd" == *core/client.js* ]]
 }
 
+# 构建产物比源码旧（或不存在）时才重新构建，避免每次启动都重跑一遍构建。
+needs_build(){
+  local out="$1"; shift
+  [[ -f "$out" ]] || return 0
+  local newer
+  newer="$(find "$@" -newer "$out" -print -quit 2>/dev/null || true)"
+  [[ -n "$newer" ]]
+}
+
 start_source(){
   need_project
   if source_running; then
@@ -1304,11 +1382,11 @@ start_source(){
   if [[ ! -d "$PROJECT_DIR/node_modules" ]]; then
     pnpm_install_multi "$PROJECT_DIR" || die '依赖安装失败：已试全部 npm 镜像，可用 NPM_REGISTRIES 环境变量覆盖'
   fi
-  if [[ ! -f "$PROJECT_DIR/web/dist/index.html" ]]; then
+  if needs_build "$PROJECT_DIR/web/dist/index.html" "$PROJECT_DIR/web/src" "$PROJECT_DIR/web/package.json" "$PROJECT_DIR/web/vite.config.ts"; then
     info '构建前端（pnpm -C web run build）…'
     run_pnpm -C "$PROJECT_DIR/web" run build
   fi
-  if [[ ! -f "$PROJECT_DIR/core/client.js" ]]; then
+  if needs_build "$PROJECT_DIR/core/client.js" "$PROJECT_DIR/core/src" "$PROJECT_DIR/core/package.json" "$PROJECT_DIR/core/tsconfig.json"; then
     info '构建后端（pnpm -C core run build:ts）…'
     run_pnpm -C "$PROJECT_DIR/core" run build:ts
   fi
@@ -1400,6 +1478,7 @@ menu(){
     printf '4. Docker 启动并全自动安装/配置 NapCat（Docker 安装）与 qq-miniapp-auth\n'
     printf '5. 重启 NapCat\n'
     printf '6. 重置管理员密码\n'
+    printf '7. 修复 QQ 扫码登录（重置卡住的登录状态）\n'
     printf '0. 退出\n'
     read -r -p '请选择：' choice
     case "$choice" in
@@ -1435,6 +1514,7 @@ menu(){
         ;;
       5) restart_napcat;;
       6) reset_admin;;
+      7) fix_qq_login;;
       0) exit 0;;
       *) warn '无效选项';;
     esac

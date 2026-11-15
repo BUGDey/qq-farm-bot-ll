@@ -176,15 +176,18 @@ chmod +x ./qq-farm.sh
 
 | 选项 | 说明 |
 | --- | --- |
-| `1` | 源码后台启动（`pnpm` 构建 Web/Core 后后台运行 `node core/client.js`） |
+| `1` | 源码后台启动（源码有改动时才重新构建 Web/Core，然后后台运行 `node core/client.js`） |
 | `2` | Docker Compose 启动 |
 | `3` | 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Shell 安装，不使用 Docker**） |
 | `4` | Docker 启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Docker 安装**） |
 | `5` | 重启 NapCat |
 | `6` | 重置管理员密码并打印访问地址、账号与新密码 |
+| `7` | 修复 QQ 扫码登录（重置卡住的登录状态） |
 | `0` | 退出 |
 
 启动完成后脚本会打印面板地址（本机 IP + 端口，能取到公网 IP 时额外打印一行），首次启动还会打印管理员账号和密码；之后再启动只打印地址，重置密码时再打印账号和新密码。
+
+选项 `7` 用于 QQ 扫码登录页面一直提示「工作流繁忙」「刷新二维码没反应」的情况：它会读授权服务的 `/api/health` 显示当前是否有登录卡住，然后重启 qq-miniapp-auth（内存里的单例登录工作流随之清空），并让 NapCat 重启登录 worker，之后回面板重新点「刷新二维码」即可。正常情况下不需要手动用它——面板在刷新二维码时会先释放上一个任务再建新任务。
 
 **NapCat 版本固定跟随上游 [BUGDey/qq-farm-bot](https://github.com/BUGDey/qq-farm-bot) 的 `v4.18.19`**，可用 `NAPCAT_VERSION` 覆盖。
 

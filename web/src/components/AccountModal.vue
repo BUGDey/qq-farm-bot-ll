@@ -399,8 +399,6 @@ function resetQqLogin() {
   const taskId = qqTaskId.value
   qqFlowVersion += 1
   stopQqPolling()
-  if (taskId)
-    void cancelQqLoginTask(taskId)
   qqTaskId.value = ''
   qqStatus.value = ''
   qqError.value = ''
@@ -408,6 +406,15 @@ function resetQqLogin() {
   qqLoading.value = false
   qqPendingCode = ''
   clearQrNameSubmitTimer()
+  return taskId
+}
+
+// 关闭弹窗/切页时要把任务从服务端释放掉，否则 NapCat 侧的登录工作流会一直占着，
+// 下次再打开只能拿到「工作流繁忙」。
+function releaseQqLogin() {
+  const taskId = resetQqLogin()
+  if (taskId)
+    void cancelQqLoginTask(taskId)
 }
 
 function isQqFlowActive(taskId: string, flowVersion: number) {
@@ -458,6 +465,39 @@ async function cancelQqLoginTask(taskId: string) {
     ensureQqApiOk(response, 'QQ 登录任务取消失败')
   }
   catch {}
+}
+
+const QQ_BUSY_PHRASES = ['还没结束', '工作流繁忙']
+
+function isQqWorkflowBusy(error: any) {
+  const message = getApiErrorMessage(error, '')
+  return QQ_BUSY_PHRASES.some(phrase => message.includes(phrase))
+}
+
+// 旧任务刚取消时服务端可能还没释放工作流（注销要重启 NapCat worker），
+// 短暂重试而不是直接把错误丢给用户。
+async function createQqLoginTaskWithRetry(flowVersion: number) {
+  let lastError: any
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    if (flowVersion !== qqFlowVersion)
+      throw new Error('QQ 登录流程已取消')
+    try {
+      const response = await api.post('/api/qq-login/tasks', undefined, {
+        timeout: 120000,
+        skipErrorToast: true,
+      } as any)
+      return ensureQqApiOk(response, 'QQ 登录二维码获取失败')
+    }
+    catch (error: any) {
+      lastError = error
+      if (!isQqWorkflowBusy(error))
+        throw error
+      if (attempt === 0)
+        qqStatus.value = '正在结束上一次登录…'
+      await new Promise(resolve => setTimeout(resolve, 2000))
+    }
+  }
+  throw lastError
 }
 
 async function pollQqLoginRequest(taskId: string, flowVersion: number) {
@@ -549,12 +589,16 @@ async function startQqLogin() {
     activeLoginTab.value = 'code'
     return
   }
-  resetQqLogin()
+  const staleTaskId = resetQqLogin()
   const flowVersion = qqFlowVersion
   qqLoading.value = true
   try {
-    const response = await api.post('/api/qq-login/tasks')
-    const payload = ensureQqApiOk(response, 'QQ 登录二维码获取失败')
+    // NapCat 同一时刻只允许一个扫码登录，必须等旧任务在服务端释放后再建新任务。
+    if (staleTaskId)
+      await cancelQqLoginTask(staleTaskId)
+    if (flowVersion !== qqFlowVersion)
+      return
+    const payload = await createQqLoginTaskWithRetry(flowVersion)
     const task = payload?.data
     const taskId = String(task?.task_id || '')
     const qrImage = String(task?.qr_image || '')
@@ -568,8 +612,12 @@ async function startQqLogin() {
     void pollQqLogin(taskId, flowVersion)
   }
   catch (error: any) {
-    if (flowVersion === qqFlowVersion)
-      qqError.value = getApiErrorMessage(error, 'QQ 登录二维码获取失败')
+    if (flowVersion === qqFlowVersion) {
+      qqStatus.value = ''
+      qqError.value = isQqWorkflowBusy(error)
+        ? `${getApiErrorMessage(error, 'QQ 登录二维码获取失败')}；若一直这样，在服务器上运行 qq-farm.sh 选 7 重置登录状态`
+        : getApiErrorMessage(error, 'QQ 登录二维码获取失败')
+    }
   }
   finally {
     if (flowVersion === qqFlowVersion)
@@ -579,7 +627,7 @@ async function startQqLogin() {
 
 function close() {
   resetWxLogin()
-  resetQqLogin()
+  releaseQqLogin()
   emit('close')
 }
 
@@ -614,7 +662,7 @@ watch(activeLoginTab, (tab) => {
   if (tab !== 'wx_qr')
     resetWxLogin()
   if (tab !== 'qq_qr')
-    resetQqLogin()
+    releaseQqLogin()
 })
 
 watch(() => form.name, (name) => {
@@ -631,7 +679,7 @@ watch(() => form.name, (name) => {
 
 onBeforeUnmount(() => {
   resetWxLogin()
-  resetQqLogin()
+  releaseQqLogin()
 })
 </script>
 

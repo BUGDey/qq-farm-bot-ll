@@ -48,7 +48,7 @@ function napCatErrorMessage(data: any): string {
         case 'INVALID_SIGNATURE':
             return 'NapCat 接口签名无效，请检查配置';
         case 'WORKFLOW_BUSY':
-            return 'NapCat 登录工作流繁忙，请稍后重试';
+            return workflowBusyMessage(data);
         case 'LOGIN_REQUIRED':
             return 'QQ 登录尚未确认，请先完成扫码确认';
         case 'LOGOUT_REQUIRED':
@@ -58,6 +58,21 @@ function napCatErrorMessage(data: any): string {
         default:
             return `NapCat 接口返回失败${errorCode ? `（${errorCode}）` : ''}`;
     }
+}
+
+function workflowBusyMessage(data: any): string {
+    const expiresAt = Number(data?.expiresAt);
+    const remaining = Number.isFinite(expiresAt) ? Math.ceil((expiresAt - Date.now()) / 1000) : 0;
+    if (remaining > 0)
+        return `上一次扫码登录还没结束，请约 ${remaining} 秒后再刷新二维码`;
+    return '上一次扫码登录还没结束，请稍后刷新二维码';
+}
+
+function napCatError(data: any): Error {
+    const error: any = new Error(napCatErrorMessage(data));
+    error.code = String(data?.code || '').trim().toUpperCase();
+    error.payload = data;
+    return error;
 }
 
 function normalizeTask(raw: any): QqLoginTask {
@@ -99,7 +114,7 @@ async function requestNapCat(path: string, body: Record<string, unknown>, requir
 
     const data = response?.data;
     if (requireOk && (!data || typeof data !== 'object' || data.ok !== true)) {
-        throw new Error(napCatErrorMessage(data));
+        throw napCatError(data);
     }
     return data;
 }

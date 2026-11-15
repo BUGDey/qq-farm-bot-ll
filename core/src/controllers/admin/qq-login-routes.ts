@@ -15,9 +15,11 @@ function publicTask(task: any) {
 }
 
 function sendError(res: Response, error: any, fallback: string): void {
+    const code = String(error?.code || '').trim();
     res.json({
         ok: false,
         error: String(error?.message || '').trim() || fallback,
+        ...(code ? { code } : {}),
     });
 }
 
