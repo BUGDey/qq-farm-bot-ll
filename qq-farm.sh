@@ -2,18 +2,27 @@
 set -Eeuo pipefail
 
 # QQ Farm Bot + NapCat Linux 管理脚本
-# 放置方式：脚本与 qq-farm-bot 目录同级
-# ./qq-farm-manager.sh
-# ./qq-farm-bot/
-# ./napcat/                 NapCat 安装、配置和数据目录
+# 放置方式：脚本放在项目根目录（与 core/、web/、package.json 同级）
+# ./qq-farm.sh
+# ./core/  ./web/  ./package.json
+# ./napcat/                 NapCat 安装、配置和数据目录（脚本所在目录内新建）
+# ./qq-miniapp-auth/       QQ 扫码授权服务（脚本所在目录内新建）
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-PROJECT_DIR="$ROOT_DIR/qq-farm-bot"
+# 兼容两种布局：脚本位于项目根内（当前仓库形态）或与 qq-farm-bot/ 目录同级
+if [[ -d "$ROOT_DIR/core" && -f "$ROOT_DIR/package.json" ]]; then
+  PROJECT_DIR="$ROOT_DIR"
+elif [[ -d "$ROOT_DIR/qq-farm-bot" ]]; then
+  PROJECT_DIR="$ROOT_DIR/qq-farm-bot"
+else
+  PROJECT_DIR="$ROOT_DIR/qq-farm-bot"
+fi
 NAPCAT_DIR="$ROOT_DIR/napcat"
 AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 AUTH_REPO="https://github.com/liyangpengs/qq-miniapp-auth.git"
 AUTH_TARBALL_URL="https://codeload.github.com/liyangpengs/qq-miniapp-auth/tar.gz/refs/heads/master"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
+TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
 FARM_ADMIN="$FARM_DATA/admin.json"

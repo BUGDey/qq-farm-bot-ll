@@ -1,5 +1,7 @@
 # QQ 农场多账号挂机 + Web 面板
 
+> 本仓库：<https://github.com/BUGDey/qq-farm-bot-ll>，基于上游 [liyangpengs/qq-farm-bot](https://github.com/liyangpengs/qq-farm-bot) 整理，额外附带 `qq-farm.sh` 一键管理脚本（Linux，自动安装并配置 NapCat / QQ 扫码）。
+
 基于 Node.js 的 QQ 农场自动化工具，提供多账号挂机、农场与好友自动化、独立图鉴与藏品、活动中心、商城、数据分析和 Web 控制面板。当前项目版本为 `20261102`，QQ 与微信游戏协议版本均为 `1.16.1.6_20261028`，两端独立维护版本配置和 TSDK/WASM。
 
 > [!IMPORTANT]
@@ -108,8 +110,8 @@ pnpm --version
 Windows、Linux 和 macOS 均可使用以下方式：
 
 ```bash
-git clone https://github.com/liyangpengs/qq-farm-bot.git
-cd qq-farm-bot
+git clone https://github.com/BUGDey/qq-farm-bot-ll.git
+cd qq-farm-bot-ll
 pnpm install
 pnpm dev
 ```
@@ -134,8 +136,8 @@ pnpm dev:core
 ### Linux 后台脚本
 
 ```bash
-git clone https://github.com/liyangpengs/qq-farm-bot.git
-cd qq-farm-bot
+git clone https://github.com/BUGDey/qq-farm-bot-ll.git
+cd qq-farm-bot-ll
 corepack enable
 bash ./start.sh
 
@@ -153,11 +155,39 @@ bash ./stop.sh
 
 前端类型检查已与生产构建拆分，需要单独检查时执行 `pnpm typecheck:web`。
 
+### 一键管理脚本（Linux，自动配置 NapCat / QQ 扫码）
+
+仓库根目录的 `qq-farm.sh` 是一个面向 Linux 的交互式管理脚本，把源码/Docker 启动与 NapCat、QQ 扫码所需的两项登录配置串成一条命令。需要 Node.js 20+、pnpm/corepack、`python3`、`curl`、`tar`、`unzip`（Docker 相关选项还需要 Docker Compose 与运行中的 Docker）。
+
+```bash
+chmod +x ./qq-farm.sh
+./qq-farm.sh
+```
+
+菜单选项：
+
+| 选项 | 说明 |
+| --- | --- |
+| `1` | 源码后台启动（`pnpm` 构建 Web/Core 后后台运行 `node core/client.js`） |
+| `2` | Docker Compose 启动 |
+| `3` | 源码启动并自动安装/配置 NapCat 与 qq-miniapp-auth |
+| `4` | Docker 启动并自动安装/配置 NapCat 与 qq-miniapp-auth |
+| `5` | 重启 NapCat |
+| `6` | 重置管理员密码并打印账号/随机密码 |
+| `0` | 退出 |
+
+选项 `3` / `4` 会依次完成：通过 NapCat-Installer 安装 NapCat、拉取并启动上游 [qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth)、安装 `qq-miniapp-openauth` 插件（写入 `config/plugins.json` 与 `napcat.mjs` 白名单）、把 OneBot HTTP 服务配到 `127.0.0.1:3000`，最后把「NapCat 接口地址」（`napCatEndpoint`，默认 `http://127.0.0.1:8787`）和「接口签名」（`napCatSignature`，即 `API_SIGNING_SECRET`）写入 `core/data/store.json`（Docker 模式通过 `docker cp` 写入容器并重启），省去在「设置 → 系统设置 → 登录设置」里手动填写。首次使用 QQ 扫码登录请优先选 `3` 或 `4`。
+
+脚本会把它生成的目录放在脚本所在目录：`napcat/`（NapCat 安装、配置、数据）、`qq-miniapp-auth/`（授权服务源码）。配置持久化在 `napcat/manager-config.env`（`API_ENDPOINT`、`API_SECRET`、`ONEBOT_PORT`、`ONEBOT_TOKEN`、`NAPCAT_ROOT`）。源码后台日志写入 `app_linux.log` / `app_linux.error.log`，进程号记录在 `app_linux.pid`。Docker 模式让授权服务经 `host.docker.internal:3000` 访问 NapCat，可用 `export NAPCAT_HOST_IP=<局域网 IP>` 覆盖。
+
+> [!NOTE]
+> 该脚本尚未在真实 Linux 机器上做过一次完整的 QQ 扫码验证；菜单 `3` / `4` 完成后仍需按 NapCat 提示完成一次真实扫码。
+
 ### Docker Compose
 
 ```bash
-git clone https://github.com/liyangpengs/qq-farm-bot.git
-cd qq-farm-bot
+git clone https://github.com/BUGDey/qq-farm-bot-ll.git
+cd qq-farm-bot-ll
 docker compose up -d --build
 
 # 仅重启现有容器，不触发镜像构建
@@ -195,7 +225,7 @@ NPM_REGISTRY=https://registry.npmmirror.com/
 
 ### 二进制发布版
 
-可从 [Releases](https://github.com/liyangpengs/qq-farm-bot/releases) 下载对应平台文件，也可以自行构建：
+可从 [Releases](https://github.com/BUGDey/qq-farm-bot-ll/releases) 下载对应平台文件，也可以自行构建：
 
 ```bash
 pnpm install
@@ -215,14 +245,14 @@ chmod +x ./qq-farm-bot
 
 1. 打开 Web 面板，使用 `admin` / `admin` 登录。
 2. 进入“设置 → 系统设置”修改管理员密码。
-3. 如需使用 QQ 扫码登录，先部署并启动 [qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth) 服务，再在“设置 → 系统设置 → 登录设置”开启 QQ 扫码登录，并填写 NapCat 接口地址和接口签名。
+3. 如需使用 QQ 扫码登录，Linux 下可直接运行 `./qq-farm.sh` 并选 `3`（源码）或 `4`（Docker），脚本会自动安装/配置 NapCat、[qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth) 及两项登录配置；手动部署时需在“设置 → 系统设置 → 登录设置”开启 QQ 扫码登录，并填写 NapCat 接口地址和接口签名。
 4. 在设置页添加游戏账号，可使用有效 Code、微信扫码或 QQ扫码登录。
 5. 为账号配置种植、自动化和好友策略，并按需设置实例级下线提醒。
 6. 启动账号，在概览页确认连接状态、农场数据和实时日志。
 
 Code 具有时效性；登录失败时应先重新获取 Code 或重新扫码。QQ 客户端被挤下线后，官方“重新登录”会签发新的 Code；可启动 QQFarmCodeHelper 的标准获取模式并开启自动同步，再点击官方“重新登录”，Helper 会更新匹配账号的 Code 并重新启动远程账号。协议监听模式只落盘抓包，永远不会自动上传 Code。
 
-QQ 扫码登录依赖外部 [qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth) 服务。登录设置中的 NapCat 接口地址需填写该服务的可访问地址，NapCat 接口签名需与其 `API_SIGNING_SECRET` 配置一致；两者会保存在本机数据目录中，由后端调用外部服务时读取。QQ 扫码登录默认关闭，开启前必须同时配置接口地址和签名。
+QQ 扫码登录依赖外部 [qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth) 服务。登录设置中的 NapCat 接口地址需填写该服务的可访问地址，NapCat 接口签名需与其 `API_SIGNING_SECRET` 配置一致；两者会保存在本机数据目录中，由后端调用外部服务时读取。QQ 扫码登录默认关闭，开启前必须同时配置接口地址和签名。上文的一键脚本 `qq-farm.sh` 选项 `3` / `4` 会自动写入这两项并开启 QQ 扫码登录。
 
 ## 配置说明
 
@@ -294,7 +324,7 @@ QQ 扫码登录依赖外部 [qq-miniapp-auth](https://github.com/liyangpengs/qq-
 ## 项目结构
 
 ```text
-qq-farm-bot/
+qq-farm-bot-ll/
 ├── core/                  # Node.js 后端、账号 Worker 与协议实现
 │   ├── src/
 │   │   ├── controllers/   # Web API 与鉴权路由
@@ -312,6 +342,11 @@ qq-farm-bot/
 │   └── dist/              # 前端构建产物
 ├── docs/                  # 项目专题文档
 ├── tools/                 # 配置下载、图片下载与协议分析工具
+├── qq-farm.sh             # Linux 一键管理脚本（自动配置 NapCat / QQ 扫码）
+├── start.sh               # Linux 源码后台启动脚本
+├── stop.sh                # Linux 服务停止脚本
+├── napcat/                # 由 qq-farm.sh 生成：NapCat 安装与配置（不入库）
+├── qq-miniapp-auth/       # 由 qq-farm.sh 生成：QQ 扫码授权服务（不入库）
 ├── docker-compose.yml
 ├── pnpm-workspace.yaml
 └── package.json
@@ -375,6 +410,7 @@ pnpm -C core exec tsx ../tools/audit-capture-compatibility.js <capture-dir>
 - [神秘商人、游戏商城与购买协议](docs/shop-protocols.md)
 - [好友宠物缓存与每日同步](docs/friend-pet-cache.md)
 - [个人页宠物协议](docs/pet-protocols.md)
+- [图鉴、变异宝典与藏品](docs/collections-20261101.md)
 
 ## 免责声明
 
@@ -383,5 +419,3 @@ pnpm -C core exec tsx ../tools/audit-capture-compatibility.js <capture-dir>
 <div align="center">
   <p>如果觉得项目有用，欢迎点一个 Star。</p>
 </div>
-
-- [图鉴、变异宝典与藏品](docs/collections-20261101.md)
