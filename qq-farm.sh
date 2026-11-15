@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-16.7"
+SCRIPT_VERSION="2026-11-16.8"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -67,6 +67,73 @@ warn(){ printf '\033[33m[WARN]\033[0m %s\n' "$*" >&2; }
 die(){ printf '\033[31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
 need_project(){ [[ -d "$PROJECT_DIR" ]] || die "找不到项目目录：$PROJECT_DIR"; }
+
+farm_port(){
+  local port="${ADMIN_PORT:-}" fallback='' line
+  if [[ -f "$PROJECT_DIR/.env" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        ADMIN_PORT=*) [[ -n "$port" ]] || port="${line#ADMIN_PORT=}" ;;
+        PORT=*) [[ -n "$fallback" ]] || fallback="${line#PORT=}" ;;
+      esac
+    done < "$PROJECT_DIR/.env"
+  fi
+  port="${port//[^0-9]/}"
+  [[ -n "$port" ]] || port="${fallback//[^0-9]/}"
+  [[ -n "$port" ]] || port=3007
+  printf '%s' "$port"
+}
+
+local_ip(){
+  local ip=''
+  if [[ -n "${PANEL_IP:-}" ]]; then
+    printf '%s' "$PANEL_IP"
+    return 0
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')" || true
+  fi
+  if [[ -z "$ip" ]] && command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')" || true
+  fi
+  printf '%s' "${ip:-127.0.0.1}"
+}
+
+public_ip(){
+  local ip=''
+  [[ -n "${PANEL_PUBLIC_IP:-}" ]] && { printf '%s' "$PANEL_PUBLIC_IP"; return 0; }
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsS --max-time 2 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  [[ "$ip" =~ ^[0-9.]+$ ]] || ip=''
+  printf '%s' "$ip"
+}
+
+report_panel_access(){
+  local show="${1:-0}" user="${2:-admin}" pass="${3:-}" port lan pub
+  port="$(farm_port)"
+  lan="$(local_ip)"
+  pub="$(public_ip)"
+  printf '\n'
+  if [[ -n "$pub" && "$pub" != "$lan" ]]; then
+    printf '\033[32m[面板]\033[0m 访问地址：http://%s:%s\n' "$pub" "$port"
+  fi
+  if [[ "$lan" != 127.0.0.1 && "$lan" != 0.0.0.0 ]]; then
+    printf '\033[32m[面板]\033[0m 本机 IP 访问：http://%s:%s\n' "$lan" "$port"
+  fi
+  printf '\033[32m[面板]\033[0m 本地访问：http://127.0.0.1:%s\n' "$port"
+  if [[ "$show" == 1 ]]; then
+    printf '\033[32m[登录]\033[0m 管理员账号：%s\n' "$user"
+    printf '\033[32m[登录]\033[0m 管理员密码：%s\n' "$pass"
+  fi
+  printf '\n'
+}
+
+# 首次构建启动时才打印账号密码；之后只打印访问地址。
+# 用 marker 记录「已经打印过」，marker 在 napcat 目录下（已被 .gitignore 忽略）。
+creds_marker(){ printf '%s' "$NAPCAT_DIR/.panel-credentials-shown"; }
+creds_shown(){ [[ -f "$(creds_marker)" ]]; }
+mark_creds_shown(){ mkdir -p "$NAPCAT_DIR" 2>/dev/null || true; : > "$(creds_marker)" 2>/dev/null || true; }
 
 # 生成随机字母数字串。
 # 注意：不要写成 `tr ... </dev/urandom | head -c N`——head 读够就退出会让 tr 收到
@@ -453,7 +520,7 @@ napcat_prepare_shell_zip(){
 }
 
 # 开放 6099（尽力而为，失败不影响安装）
-open_port_6099(){
+open_port(){
   local port="${1:-6099}"
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
     as_root ufw allow "${port}/tcp" >/dev/null 2>&1 || true
@@ -510,7 +577,7 @@ install_napcat_shell(){
   NAPCAT_MODE="native"
   save_state
   ok "NapCat Shell 已安装：$root"
-  open_port_6099 6099
+  open_port 6099
 }
 
 # installer 是 rootless 的：装到 ~/Napcat 下
@@ -637,7 +704,7 @@ install_napcat_docker(){
   status="$(docker ps --filter "name=$NAPCAT_CONTAINER" --format '{{.Status}}' 2>/dev/null || true)"
   [[ "$status" == *Up* ]] || die "NapCat 容器未正常运行，请查看：docker logs $NAPCAT_CONTAINER"
   ok "NapCat 容器已启动：$NAPCAT_CONTAINER（WebUI 127.0.0.1:6099，OneBot 127.0.0.1:$ONEBOT_PORT）"
-  open_port_6099 6099
+  open_port 6099
 }
 
 # ---------------------------------------------------------------- 授权服务
@@ -1229,8 +1296,11 @@ start_source(){
   need_project
   if source_running; then
     ok "源码服务已在运行，PID $(cat "$SOURCE_PID")"
+    report_panel_access 0
     return 0
   fi
+  local first_run=0
+  creds_shown || first_run=1
   if [[ ! -d "$PROJECT_DIR/node_modules" ]]; then
     pnpm_install_multi "$PROJECT_DIR" || die '依赖安装失败：已试全部 npm 镜像，可用 NPM_REGISTRIES 环境变量覆盖'
   fi
@@ -1249,6 +1319,12 @@ start_source(){
   local pid; pid="$(cat "$SOURCE_PID" 2>/dev/null || echo '')"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     ok "源码服务已后台启动，PID=$pid，日志：$SOURCE_LOG"
+    if [[ "$first_run" == 1 ]]; then
+      report_panel_access 1 admin admin
+      mark_creds_shown
+    else
+      report_panel_access 0
+    fi
   else
     tail -20 "$SOURCE_ERR" >&2 || true
     die "源码服务启动失败，请查看 $SOURCE_ERR"
@@ -1268,12 +1344,24 @@ compose_up(){
 }
 
 start_docker(){
+  local quiet="${1:-0}"
   need docker
   need_project
   docker info >/dev/null 2>&1 || die 'Docker 未运行或当前用户无权访问 Docker'
+  local first_run=0
+  creds_shown || first_run=1
   info '启动农场容器…'
   compose_up
   ok '农场 Docker 已启动'
+  if [[ "$quiet" == 1 ]]; then
+    return 0
+  fi
+  if [[ "$first_run" == 1 ]]; then
+    report_panel_access 1 admin admin
+    mark_creds_shown
+  else
+    report_panel_access 0
+  fi
 }
 
 reset_admin(){
@@ -1297,7 +1385,8 @@ fs.mkdirSync(require("path").dirname(path), { recursive: true });
 fs.writeFileSync(path + ".tmp", JSON.stringify(obj, null, 2) + "\n");
 fs.renameSync(path + ".tmp", path);
 ' "$FARM_ADMIN" "$password"
-  printf '\n管理员账号：admin\n管理员密码：%s\n\n' "$password"
+  mark_creds_shown
+  report_panel_access 1 admin "$password"
 }
 
 # ---------------------------------------------------------------- 菜单
@@ -1333,10 +1422,16 @@ menu(){
         install_auth_service
         install_napcat_plugin
         configure_napcat
-        start_docker
+        start_docker 1
         configure_docker
         start_auth_service
         start_napcat
+        if creds_shown; then
+          report_panel_access 0
+        else
+          report_panel_access 1 admin admin
+          mark_creds_shown
+        fi
         ;;
       5) restart_napcat;;
       6) reset_admin;;

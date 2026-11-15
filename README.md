@@ -181,8 +181,10 @@ chmod +x ./qq-farm.sh
 | `3` | 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Shell 安装，不使用 Docker**） |
 | `4` | Docker 启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Docker 安装**） |
 | `5` | 重启 NapCat |
-| `6` | 重置管理员密码并打印账号/随机密码 |
+| `6` | 重置管理员密码并打印访问地址、账号与新密码 |
 | `0` | 退出 |
+
+启动完成后脚本会打印面板地址（本机 IP + 端口，能取到公网 IP 时额外打印一行），首次启动还会打印管理员账号和密码；之后再启动只打印地址，重置密码时再打印账号和新密码。
 
 **NapCat 版本固定跟随上游 [BUGDey/qq-farm-bot](https://github.com/BUGDey/qq-farm-bot) 的 `v4.18.19`**，可用 `NAPCAT_VERSION` 覆盖。
 
