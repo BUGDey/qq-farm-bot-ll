@@ -2,6 +2,10 @@
 set -Eeuo pipefail
 shopt -s inherit_errexit
 
+# 出错时打印是哪条命令失败的，避免脚本毫无提示地静默退出
+# 只在最外层打印（子 shell 里的同一失败会再冒泡到外层，重复打印没有意义）
+trap 'rc=$?; if [[ ${BASH_SUBSHELL:-0} -eq 0 ]]; then printf "\033[31m[FAIL]\033[0m 命令执行失败（退出码 %s）：%s\n" "$rc" "$BASH_COMMAND" >&2; printf "\033[31m[FAIL]\033[0m 请把上面这行命令的输出一起发出来，方便定位问题。\n" >&2; fi' ERR
+
 # QQ Farm Bot + NapCat Linux 一键管理脚本
 # 放置方式：脚本放在项目根目录（与 core/、web/、package.json 同级）
 # ./qq-farm.sh
@@ -49,6 +53,19 @@ die(){ printf '\033[31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
 need_project(){ [[ -d "$PROJECT_DIR" ]] || die "找不到项目目录：$PROJECT_DIR"; }
 
+# 生成随机字母数字串。
+# 注意：不要写成 `tr ... </dev/urandom | head -c N`——head 读够就退出会让 tr 收到
+# SIGPIPE 而失败，配合 pipefail + set -e 会让脚本毫无提示地静默退出。
+# 这里先取固定长度的随机源，再用 bash 字符串截断，保证管道末端不会被提前关闭。
+rand_alnum(){
+  local n="${1:-32}" raw=''
+  raw="$(head -c 512 /dev/urandom 2>/dev/null | base64 | tr -d '\n+/=')" || raw=''
+  if [[ -z "$raw" ]]; then
+    raw="$(date +%s%N)$$${RANDOM}${RANDOM}${RANDOM}"
+  fi
+  printf '%s' "${raw:0:n}"
+}
+
 if [[ ${EUID:-0} -eq 0 ]]; then IS_ROOT=1; else IS_ROOT=0; fi
 as_root(){
   if [[ "$IS_ROOT" -eq 1 ]]; then "$@"; else sudo "$@"; fi
@@ -94,7 +111,7 @@ read_settings(){
   API_SECRET="${API_SECRET:-qq-miniapp-auth-default-signing-secret}"
   ONEBOT_PORT="${ONEBOT_PORT:-3000}"
   if [[ -z "${ONEBOT_TOKEN:-}" ]]; then
-    ONEBOT_TOKEN="qq-farm-$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 32)"
+    ONEBOT_TOKEN="qq-farm-$(rand_alnum 32)"
   fi
   [[ "$API_ENDPOINT" =~ ^https?:// ]] || die 'API 地址必须以 http:// 或 https:// 开头'
   save_state
@@ -489,9 +506,19 @@ ensure_napcat_base_image(){
   printf '%s\n' "$load_out" | grep -E '^Loaded image' >&2 || true
   if ! docker image inspect "$NAPCAT_IMAGE" >/dev/null 2>&1; then
     # 离线包里的仓库名可能与 NAPCAT_IMAGE 不同，把刚导入的镜像重新打标签
-    local loaded_ref
-    loaded_ref="$(printf '%s\n' "$load_out" | sed -n 's/^Loaded image: //p' | head -n1)"
-    [[ -n "$loaded_ref" ]] || loaded_ref="$(printf '%s\n' "$load_out" | sed -n 's/^Loaded image ID: //p' | head -n1)"
+    local loaded_ref='' line
+    while IFS= read -r line; do
+      case "$line" in
+        'Loaded image: '*) loaded_ref="${line#Loaded image: }"; break;;
+      esac
+    done <<< "$load_out"
+    if [[ -z "$loaded_ref" ]]; then
+      while IFS= read -r line; do
+        case "$line" in
+          'Loaded image ID: '*) loaded_ref="${line#Loaded image ID: }"; break;;
+        esac
+      done <<< "$load_out"
+    fi
     [[ -n "$loaded_ref" ]] || die 'docker load 成功但无法识别镜像名，请手动 docker tag 后重试'
     docker tag "$loaded_ref" "$NAPCAT_IMAGE" \
       || die "无法将 $loaded_ref 标记为 $NAPCAT_IMAGE"
@@ -541,7 +568,9 @@ DOCKER
   NAPCAT_ROOT="$NAPCAT_DIR"
   save_state
   sleep 3
-  docker ps --filter "name=$NAPCAT_CONTAINER" --format '{{.Status}}' | grep -q Up \
+  local napcat_status=''
+  napcat_status="$(docker ps --filter "name=$NAPCAT_CONTAINER" --format '{{.Status}}' 2>/dev/null || true)"
+  [[ "$napcat_status" == *Up* ]] \
     || die "NapCat 容器未正常运行，请查看：docker logs $NAPCAT_CONTAINER"
   ok "NapCat 容器已启动：$NAPCAT_CONTAINER（WebUI 127.0.0.1:6099，OneBot 127.0.0.1:$ONEBOT_PORT）"
 }
@@ -557,7 +586,7 @@ install_auth_service(){
     mkdir -p "$ROOT_DIR/.auth-extract"
     tar -xzf "$tmp" -C "$ROOT_DIR/.auth-extract"
     local extracted
-    extracted="$(find "$ROOT_DIR/.auth-extract" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+    extracted="$(find "$ROOT_DIR/.auth-extract" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)"
     [[ -n "$extracted" ]] || die 'qq-miniapp-auth 源码解压失败'
     mv "$extracted" "$AUTH_DIR"
     rm -rf "$ROOT_DIR/.auth-extract" "$tmp"
@@ -646,7 +675,7 @@ install_napcat_plugin(){
   as_root mkdir -p "$plugin_dir" "$(dirname "$plugin_cfg")"
   as_root cp -a "$AUTH_DIR/napcat-openauth-plugin/." "$plugin_dir/"
   local token
-  token="$(grep -E '^NAPCAT_OPEN_AUTH_PLUGIN_TOKEN=' "$AUTH_DIR/.env" | head -n1 | cut -d= -f2- || true)"
+  token="$(sed -n 's/^NAPCAT_OPEN_AUTH_PLUGIN_TOKEN=//p' "$AUTH_DIR/.env" 2>/dev/null | sed -n '1p' || true)"
   [[ -n "$token" ]] || token="$ONEBOT_TOKEN"
   node -e '
 const fs = require("fs");
@@ -816,8 +845,13 @@ start_napcat_native(){
   if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
     docker start "$NAPCAT_CONTAINER" >/dev/null 2>&1 || true
     sleep 2
-    docker ps --filter "name=$NAPCAT_CONTAINER" --format '{{.Status}}' | grep -q Up \
-      && ok "NapCat 容器已运行：$NAPCAT_CONTAINER" || die "NapCat 容器启动失败：docker logs $NAPCAT_CONTAINER"
+    local napcat_status=''
+    napcat_status="$(docker ps --filter "name=$NAPCAT_CONTAINER" --format '{{.Status}}' 2>/dev/null || true)"
+    if [[ "$napcat_status" == *Up* ]]; then
+      ok "NapCat 容器已运行：$NAPCAT_CONTAINER"
+    else
+      die "NapCat 容器启动失败：docker logs $NAPCAT_CONTAINER"
+    fi
     return 0
   fi
   local qq='/opt/QQ/qq'
@@ -838,8 +872,8 @@ start_napcat_native(){
   sleep 6
   # xvfb-run / setsid 可能再 fork，不能用 $! 判定存活，改为按进程名确认
   local real_pid
-  real_pid="$(pgrep -f "xvfb-run -a $qq" 2>/dev/null | head -n1 || true)"
-  [[ -n "$real_pid" ]] || real_pid="$(pgrep -x qq 2>/dev/null | head -n1 || true)"
+  real_pid="$(pgrep -f "xvfb-run -a $qq" 2>/dev/null | sed -n '1p' || true)"
+  [[ -n "$real_pid" ]] || real_pid="$(pgrep -x qq 2>/dev/null | sed -n '1p' || true)"
   [[ -n "$real_pid" ]] || die "NapCat 启动后未存活，请查看 $NAPCAT_LOG"
   echo "$real_pid" > "$NAPCAT_PID"
   ok "NapCat 已后台启动，PID=$real_pid，日志：$NAPCAT_LOG"
@@ -875,7 +909,7 @@ restart_napcat(){
 
 reset_admin(){
   need node; mkdir -p "$FARM_DATA"
-  local password="QqFarm!$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 12)"
+  local password="QqFarm!$(rand_alnum 12)"
   node -e '
 const crypto = require("crypto");
 const fs = require("fs");
