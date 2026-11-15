@@ -165,7 +165,7 @@ bash ./stop.sh
 
 ### 一键管理脚本（Linux，自动配置 NapCat / QQ 扫码）
 
-仓库根目录的 `qq-farm.sh` 是一个面向 Linux 的交互式管理脚本，把源码/Docker 启动与 NapCat、QQ 扫码所需的两项登录配置串成一条命令。需要 Node.js 20+、pnpm/corepack、`curl`、`tar`、`unzip`（Docker 相关选项还需要 Docker Compose 与运行中的 Docker）。选项 `3` / `4` 会调用社区安装器用 `apt`/`dnf` 装系统依赖，需要 root 或 sudo 权限（用 root 运行但系统没装 sudo 时，脚本会自动垫一个直通的 `sudo`）。所有 JSON 配置改写都由 Node 完成，因此不需要 `python3`。
+仓库根目录的 `qq-farm.sh` 是一个面向 Linux 的交互式管理脚本，把源码/Docker 启动与 NapCat、QQ 扫码所需的两项登录配置串成一条命令。需要 Node.js 20+、`npm`、`curl`、`tar`、`unzip`（Docker 相关选项还需要 Docker Compose 与运行中的 Docker）。pnpm 不需要预装：脚本会读项目 `package.json` 里的 `packageManager` 字段，按声明版本把 pnpm 装到 `napcat/tools/pnpm/<版本>/` 下自己用，不碰全局环境；因此 `corepack enable` 不是必需步骤。选项 `3` / `4` 会调用社区安装器用 `apt`/`dnf` 装系统依赖，需要 root 或 sudo 权限（用 root 运行但系统没装 sudo 时，脚本会自动垫一个直通的 `sudo`）。所有 JSON 配置改写都由 Node 完成，因此不需要 `python3`。
 
 ```bash
 chmod +x ./qq-farm.sh
@@ -197,7 +197,8 @@ NapNeko 官方的安装器与发布地址已经失效（`NapNeko/NapCatQQ` 的 r
 
 - `api.github.com` 不能套全部加速前缀（多数站点只代理 `github.com`），单独用实测可用的 4 个：`gh-proxy.com`、`gh-proxy.net`、`jiashu.1win.eu.org`、`git.yylx.win`；
 - qq-miniapp-auth 源码有两条出口（`github.com/<repo>/archive/refs/heads/master.tar.gz` 与 `codeload.github.com/<repo>/tar.gz/refs/heads/master`），因为加速站只认前一种形式；NapCat 安装器还额外有一条 jsDelivr 兜底（`cdn.jsdelivr.net/gh/naxida2333/NapCat-Installer@main/script/install.sh`）；
-- npm / pnpm 依赖按 `registry.npmmirror.com` → `registry.npmjs.org` → `mirrors.cloud.tencent.com/npm` → `mirrors.huaweicloud.com/repository/npm` → `registry.yarnpkg.com` 依次尝试，`corepack` 下载 pnpm 本体也指向第一个源；可用 `export NPM_REGISTRIES_OVERRIDE=<源1>,<源2>` 覆盖这张表。
+- npm / pnpm 依赖按 `registry.npmmirror.com` → `registry.npmjs.org` → `mirrors.cloud.tencent.com/npm` → `mirrors.huaweicloud.com/repository/npm` → `registry.yarnpkg.com` 依次尝试；可用 `export NPM_REGISTRIES_OVERRIDE=<源1>,<源2>` 覆盖这张表。
+- 项目声明了 `packageManager: pnpm@10.30.2`。如果系统里 `corepack` 下到的是别的版本（例如 12.x），pnpm 会以 `ERR_PNPM_BAD_PM_VERSION` 直接退出，此时换多少 registry 都没用。脚本因此不用 corepack 的版本协商：先看本地 `napcat/tools/pnpm/<声明版本>/` 有没有，没有就用 `npm install --prefix` 装一份；系统 pnpm 版本正好一致时直接用；最后才退到 `corepack pnpm --pm-on-fail=ignore` 跳过版本校验。
   - 注意 `npm ci` 不会理会 `--registry`，它严格按 `package-lock.json` 里写死的 `resolved` 地址下载 tarball，所以脚本会先把锁文件里的地址改写成当前源的规范形式（`<registry>/<包名>/-/<包文件名>-<版本>.tgz`）再装；仍失败则该源改用 `npm install` 兜底，全部源都失败时把锁文件还原。
 
 关于 QQ 客户端：**NapCat 不是独立程序，而是注入 QQ 客户端进程的插件**，自身不带 `wrapper.node`，必须由 QQ 主进程加载才能拿到 NTQQ 原生接口，所以只装 `NapCat.Shell.zip` 跑不起来——installer 会用 `dpkg -x` / `rpm2cpio` 把 QQ 解包到 `~/Napcat/opt/QQ`，全程不需要 root 也不需要系统包管理器安装。QQ 安装包默认从 [zydou/QQ-Linux](https://github.com/zydou/QQ-Linux) 的 release 取（先查 API 取最新，失败回退已知 tag），可用 `QQ_PKG_URL` 指定；两者的下载包都缓存在 `napcat/` 下，重装不会重复下载。

@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-16.6"
+SCRIPT_VERSION="2026-11-16.7"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -1124,11 +1124,77 @@ install_pkgs(){
 # ---------------------------------------------------------------- 农场本体
 
 run_pnpm(){
-  # corepack 首次会自己去下 pnpm 本体，也要走镜像，否则一样卡在 registry.npmjs.org
+  local bin
+  bin="$(pnpm_bin)" || die '无法准备 pnpm（已试本地安装与 corepack）'
+  if [[ "$bin" == "__corepack__" ]]; then
+    # corepack 沿用它自带的版本，但要跳过 packageManager 版本校验
+    COREPACK_NPM_REGISTRY="${NPM_REGISTRIES[0]}" corepack pnpm --pm-on-fail=ignore "$@"
+    return
+  fi
+  local node_bin
+  node_bin="$(command -v node 2>/dev/null || true)"
+  export NO_UPDATE_NOTIFIER=1
+  # pnpm 的入口是 .cjs，需要 Node 来跑；系统装了 pnpm 时可执行文件则直接调用
+  if [[ "$bin" == *.cjs || "$bin" == *.js ]]; then
+    [[ -n "$node_bin" ]] || die '找不到 node，无法运行 pnpm'
+    "$node_bin" "$bin" "$@"
+  else
+    "$bin" "$@"
+  fi
+}
+
+# 项目 package.json 里 packageManager 声明的 pnpm 版本（形如 pnpm@10.30.2）
+pnpm_required_version(){
+  local node_bin ver
+  node_bin="$(command -v node 2>/dev/null || true)"
+  if [[ -n "$node_bin" && -f "$PROJECT_DIR/package.json" ]]; then
+    ver="$("$node_bin" -e 'try{const p=require(process.argv[1]);const m=(p.packageManager||"").match(/^pnpm@(.+)$/);process.stdout.write(m?m[1]:"");}catch(e){}' "$PROJECT_DIR/package.json" 2>/dev/null || true)"
+    if [[ -n "$ver" ]]; then printf '%s' "$ver"; return 0; fi
+  fi
+  printf '%s' "${PNPM_VERSION:-10.30.2}"
+}
+
+# 返回一个可执行的 pnpm 入口。优先用与项目声明版本一致的本地安装，
+# 避免 corepack 自行下载最新版后因 packageManager 不匹配而直接失败。
+pnpm_bin(){
+  if [[ -n "${_PNPM_BIN_RESOLVED:-}" && -e "$_PNPM_BIN_RESOLVED" ]]; then
+    printf '%s' "$_PNPM_BIN_RESOLVED"; return 0
+  fi
+  local want reg dir entry ver_out
+  want="$(pnpm_required_version)"
+  dir="$NAPCAT_DIR/tools/pnpm/$want"
+  entry="$dir/node_modules/pnpm/bin/pnpm.cjs"
+
+  # 1) 已经装好过
+  if [[ -f "$entry" ]]; then
+    _PNPM_BIN_RESOLVED="$entry"; printf '%s' "$entry"; return 0
+  fi
+
+  # 2) 系统里现成的 pnpm 版本刚好一致就直接用
+  if command -v pnpm >/dev/null 2>&1; then
+    ver_out="$(pnpm --version 2>/dev/null || true)"
+    if [[ "$ver_out" == "$want" ]]; then
+      _PNPM_BIN_RESOLVED="$(command -v pnpm)"; printf '%s' "$_PNPM_BIN_RESOLVED"; return 0
+    fi
+  fi
+
+  # 3) 用 npm 把这个版本装到脚本目录下（不需要 root，也不碰全局环境）
+  if command -v npm >/dev/null 2>&1; then
+    mkdir -p "$dir"
+    for reg in "${NPM_REGISTRIES[@]}"; do
+      if npm install --prefix "$dir" --no-save --no-audit --no-fund --registry="$reg" "pnpm@$want" >/dev/null 2>&1; then
+        if [[ -f "$entry" ]]; then
+          _PNPM_BIN_RESOLVED="$entry"; printf '%s' "$entry"; return 0
+        fi
+      fi
+    done
+  fi
+
+  # 4) 兜底：corepack 带 --pm-on-fail=ignore 跳过版本校验
   if command -v corepack >/dev/null 2>&1; then
-    COREPACK_NPM_REGISTRY="${NPM_REGISTRIES[0]}" corepack pnpm "$@"
-  elif command -v pnpm >/dev/null 2>&1; then pnpm "$@"
-  else die '需要 pnpm 或 corepack'; fi
+    _PNPM_BIN_RESOLVED="__corepack__"; printf '%s' "__corepack__"; return 0
+  fi
+  return 1
 }
 
 # pnpm install 也按源逐个重试，全部失败才由调用方处理
