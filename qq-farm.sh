@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-16.5"
+SCRIPT_VERSION="2026-11-16.6"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -699,34 +699,88 @@ fs.writeFileSync(path, s);
   ok "qq-miniapp-auth 已准备：$AUTH_DIR"
 }
 
-# 依赖安装也走多源：npm 官方源被墙/超时时按序换镜像，避免整条安装链卡死
-NPM_REGISTRIES=(
-  "https://registry.npmmirror.com"
-  "https://registry.npmjs.org"
-  "https://mirrors.cloud.tencent.com/npm"
-)
+# 依赖安装也走多源。注意：`npm ci` 不理会 --registry，它严格按 package-lock.json 里
+# 写死的 resolved 地址下载；而 qq-miniapp-auth 的锁文件把 tarball 钉在 cdn.npmmirror.com，
+# 那台服务器连不上那个 CDN，于是换源完全无效。所以这里先把锁文件的 resolved 改写成
+# 当前源的规范地址（<registry>/<name>/-/<basename>-<version>.tgz），再执行 npm ci。
+if [[ -n "${NPM_REGISTRIES_OVERRIDE:-}" ]]; then
+  # 逗号或空格分隔，例：NPM_REGISTRIES_OVERRIDE=https://registry.npmmirror.com
+  IFS=', ' read -r -a NPM_REGISTRIES <<< "$NPM_REGISTRIES_OVERRIDE"
+else
+  NPM_REGISTRIES=(
+    "https://registry.npmmirror.com"
+    "https://registry.npmjs.org"
+    "https://mirrors.cloud.tencent.com/npm"
+    "https://mirrors.huaweicloud.com/repository/npm"
+    "https://registry.yarnpkg.com"
+  )
+fi
+
+# 把锁文件里的 tarball 地址整体改指向指定源；非 registry 来源（git/file 依赖）原样保留
+npm_rewrite_lock(){
+  local dir="$1" reg="$2"
+  local lock="$dir/package-lock.json"
+  [[ -f "$lock" ]] || return 0
+  local node_bin; node_bin="$(command -v node)" || return 1
+  "$node_bin" - "$lock" "$reg" <<'JS'
+const fs = require('fs');
+const [lockPath, reg] = process.argv.slice(2);
+const base = reg.replace(/\/+$/, '');
+let lock;
+try { lock = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch (e) { process.exit(0); }
+const pkgs = lock.packages || {};
+let changed = 0;
+for (const key of Object.keys(pkgs)) {
+  const p = pkgs[key];
+  if (!p || !p.version || !p.resolved) continue;
+  if (!/^https?:/.test(p.resolved)) continue;           // git/ssh/file 依赖不动
+  const name = p.name || key.replace(/^.*node_modules\//, '');
+  if (!name || name.startsWith('.')) continue;
+  const baseName = name.split('/').pop();
+  const fixed = `${base}/${name}/-/${baseName}-${p.version}.tgz`;
+  if (p.resolved !== fixed) { p.resolved = fixed; changed++; }
+}
+fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n');
+if (process.env.NPM_REWRITE_VERBOSE) process.stderr.write(`rewrote ${changed}\n`);
+JS
+}
 
 npm_install_in(){
   local dir="$1"; shift
   local -a extra=()
   if (( $# )); then extra=("$@"); fi
-  local reg rc
+  local reg rc lock_bak
   if [[ -d "$dir/node_modules" && -f "$dir/node_modules/.package-lock.json" ]]; then
     ok "依赖已安装，跳过：$dir"
     return 0
   fi
+  lock_bak=""
+  if [[ -f "$dir/package-lock.json" ]]; then
+    lock_bak="$dir/package-lock.json.bak.$$"
+    cp -f "$dir/package-lock.json" "$lock_bak"
+  fi
   for reg in "${NPM_REGISTRIES[@]}"; do
-    info "安装依赖（registry=$reg）…"
+    info "安装依赖（源：$reg）…"
+    npm_rewrite_lock "$dir" "$reg" || true
     pushd "$dir" >/dev/null
     if [[ -f package-lock.json ]]; then
       npm ci --omit=dev --no-audit --no-fund --registry="$reg" ${extra[@]+"${extra[@]}"} && rc=0 || rc=$?
+      # 锁文件与 registry 元数据不一致时 npm ci 会直接报错，退回普通 install 再试一次
+      if [[ "$rc" -ne 0 ]]; then
+        rm -rf node_modules
+        npm install --omit=dev --no-audit --no-fund --registry="$reg" ${extra[@]+"${extra[@]}"} && rc=0 || rc=$?
+      fi
     else
       npm install --omit=dev --no-audit --no-fund --registry="$reg" ${extra[@]+"${extra[@]}"} && rc=0 || rc=$?
     fi
     popd >/dev/null
-    if [[ "$rc" -eq 0 ]]; then return 0; fi
-    warn "该 npm 源安装失败（$reg），换下一个"
+    if [[ "$rc" -eq 0 ]]; then
+      [[ -n "$lock_bak" ]] && rm -f "$lock_bak"
+      return 0
+    fi
+    warn "该源安装失败（$reg），换下一个"
   done
+  if [[ -n "$lock_bak" && -f "$lock_bak" ]]; then mv -f "$lock_bak" "$dir/package-lock.json" 2>/dev/null || rm -f "$lock_bak"; fi
   return 1
 }
 
@@ -1082,11 +1136,16 @@ pnpm_install_multi(){
   local dir="$1"; shift
   local reg
   for reg in "${NPM_REGISTRIES[@]}"; do
-    info "安装依赖（pnpm install，registry=$reg）…"
+    info "安装依赖（源：$reg）…"
     if run_pnpm -C "$dir" install --frozen-lockfile --registry="$reg" "$@"; then
       return 0
     fi
-    warn "该 npm 源安装失败（$reg），换下一个"
+    # 锁文件与当前源解析不出同一个版本时 --frozen-lockfile 会直接拒绝，去掉该限制再试一次
+    rm -rf "$dir/node_modules"
+    if run_pnpm -C "$dir" install --registry="$reg" "$@"; then
+      return 0
+    fi
+    warn "该源安装失败（$reg），换下一个"
   done
   return 1
 }
@@ -1107,7 +1166,7 @@ start_source(){
     return 0
   fi
   if [[ ! -d "$PROJECT_DIR/node_modules" ]]; then
-    pnpm_install_multi "$PROJECT_DIR" || die '依赖安装失败：已试 npmmirror / npmjs / 腾讯云 三个源'
+    pnpm_install_multi "$PROJECT_DIR" || die '依赖安装失败：已试全部 npm 镜像，可用 NPM_REGISTRIES 环境变量覆盖'
   fi
   if [[ ! -f "$PROJECT_DIR/web/dist/index.html" ]]; then
     info '构建前端（pnpm -C web run build）…'

@@ -1,6 +1,8 @@
 # QQ 农场多账号挂机 + Web 面板
 
-> 本仓库：<https://github.com/BUGDey/qq-farm-bot-ll>，基于上游 [liyangpengs/qq-farm-bot](https://github.com/liyangpengs/qq-farm-bot) 整理，额外附带 `qq-farm.sh` 一键管理脚本（Linux，自动安装并配置 NapCat / QQ 扫码）。
+> 本仓库（两个平台同步，内容一致）：[GitHub](https://github.com/BUGDey/qq-farm-bot-ll) · [Gitee](https://gitee.com/bugdey/qq-farm-bot-ll)
+>
+> 基于上游 [liyangpengs/qq-farm-bot](https://github.com/liyangpengs/qq-farm-bot) 整理，额外附带 `qq-farm.sh` 一键管理脚本（Linux，自动安装并配置 NapCat / QQ 扫码）。国内服务器访问 Gitee 更快。
 
 基于 Node.js 的 QQ 农场自动化工具，提供多账号挂机、农场与好友自动化、独立图鉴与藏品、活动中心、商城、数据分析和 Web 控制面板。当前项目版本为 `20261102`，QQ 与微信游戏协议版本均为 `1.16.1.6_20261028`，两端独立维护版本配置和 TSDK/WASM。
 
@@ -110,7 +112,10 @@ pnpm --version
 Windows、Linux 和 macOS 均可使用以下方式：
 
 ```bash
+# GitHub（国外/直连）
 git clone https://github.com/BUGDey/qq-farm-bot-ll.git
+# Gitee（国内更快，二选一）
+# git clone https://gitee.com/bugdey/qq-farm-bot-ll.git
 cd qq-farm-bot-ll
 pnpm install
 pnpm dev
@@ -136,7 +141,10 @@ pnpm dev:core
 ### Linux 后台脚本
 
 ```bash
+# GitHub（国外/直连）
 git clone https://github.com/BUGDey/qq-farm-bot-ll.git
+# Gitee（国内更快，二选一）
+# git clone https://gitee.com/bugdey/qq-farm-bot-ll.git
 cd qq-farm-bot-ll
 corepack enable
 bash ./start.sh
@@ -189,7 +197,8 @@ NapNeko 官方的安装器与发布地址已经失效（`NapNeko/NapCatQQ` 的 r
 
 - `api.github.com` 不能套全部加速前缀（多数站点只代理 `github.com`），单独用实测可用的 4 个：`gh-proxy.com`、`gh-proxy.net`、`jiashu.1win.eu.org`、`git.yylx.win`；
 - qq-miniapp-auth 源码有两条出口（`github.com/<repo>/archive/refs/heads/master.tar.gz` 与 `codeload.github.com/<repo>/tar.gz/refs/heads/master`），因为加速站只认前一种形式；NapCat 安装器还额外有一条 jsDelivr 兜底（`cdn.jsdelivr.net/gh/naxida2333/NapCat-Installer@main/script/install.sh`）；
-- npm / pnpm 依赖按 `registry.npmmirror.com` → `registry.npmjs.org` → `mirrors.cloud.tencent.com/npm` 依次尝试，`corepack` 下载 pnpm 本体也指向第一个源。
+- npm / pnpm 依赖按 `registry.npmmirror.com` → `registry.npmjs.org` → `mirrors.cloud.tencent.com/npm` → `mirrors.huaweicloud.com/repository/npm` → `registry.yarnpkg.com` 依次尝试，`corepack` 下载 pnpm 本体也指向第一个源；可用 `export NPM_REGISTRIES_OVERRIDE=<源1>,<源2>` 覆盖这张表。
+  - 注意 `npm ci` 不会理会 `--registry`，它严格按 `package-lock.json` 里写死的 `resolved` 地址下载 tarball，所以脚本会先把锁文件里的地址改写成当前源的规范形式（`<registry>/<包名>/-/<包文件名>-<版本>.tgz`）再装；仍失败则该源改用 `npm install` 兜底，全部源都失败时把锁文件还原。
 
 关于 QQ 客户端：**NapCat 不是独立程序，而是注入 QQ 客户端进程的插件**，自身不带 `wrapper.node`，必须由 QQ 主进程加载才能拿到 NTQQ 原生接口，所以只装 `NapCat.Shell.zip` 跑不起来——installer 会用 `dpkg -x` / `rpm2cpio` 把 QQ 解包到 `~/Napcat/opt/QQ`，全程不需要 root 也不需要系统包管理器安装。QQ 安装包默认从 [zydou/QQ-Linux](https://github.com/zydou/QQ-Linux) 的 release 取（先查 API 取最新，失败回退已知 tag），可用 `QQ_PKG_URL` 指定；两者的下载包都缓存在 `napcat/` 下，重装不会重复下载。
 
@@ -216,7 +225,10 @@ NapNeko 官方的安装器与发布地址已经失效（`NapNeko/NapCatQQ` 的 r
 ### Docker Compose
 
 ```bash
+# GitHub（国外/直连）
 git clone https://github.com/BUGDey/qq-farm-bot-ll.git
+# Gitee（国内更快，二选一）
+# git clone https://gitee.com/bugdey/qq-farm-bot-ll.git
 cd qq-farm-bot-ll
 docker compose up -d --build
 
@@ -255,7 +267,7 @@ NPM_REGISTRY=https://registry.npmmirror.com/
 
 ### 二进制发布版
 
-可从 [Releases](https://github.com/BUGDey/qq-farm-bot-ll/releases) 下载对应平台文件，也可以自行构建：
+可从 [GitHub Releases](https://github.com/BUGDey/qq-farm-bot-ll/releases) 或 [Gitee 发行版](https://gitee.com/bugdey/qq-farm-bot-ll/releases) 下载对应平台文件，也可以自行构建：
 
 ```bash
 pnpm install
