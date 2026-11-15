@@ -28,6 +28,7 @@ NAPCAT_DIR="$ROOT_DIR/napcat"
 AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-https://codeload.github.com/liyangpengs/qq-miniapp-auth/tar.gz/refs/heads/master}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
+SCRIPT_VERSION="2026-11-16.2"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -189,10 +190,24 @@ start_source(){
   info "错误日志：$SOURCE_ERR"
 }
 
-start_docker(){
+compose_up(){
   need_project; need docker
   docker info >/dev/null 2>&1 || die 'Docker 未运行或当前用户无权访问 Docker'
-  docker compose -f "$COMPOSE_FILE" up -d --build
+  # 优先用 compose 插件；没有插件就用独立的 docker-compose 命令
+  if docker compose version >/dev/null 2>&1; then
+    docker compose -f "$COMPOSE_FILE" up -d --build
+  elif command -v docker-compose >/dev/null 2>&1; then
+    docker-compose -f "$COMPOSE_FILE" up -d --build
+  else
+    die '未安装 Docker Compose。请安装 compose 插件后重试：
+  apt install docker-compose-plugin    # Debian/Ubuntu
+  dnf install docker-compose-plugin    # Fedora/RHEL
+  或者改用选项 1（源码启动）'
+  fi
+}
+
+start_docker(){
+  compose_up
   ok 'Docker 已启动'
 }
 
@@ -935,7 +950,7 @@ fs.renameSync(path + ".tmp", path);
 
 menu(){
   while true; do
-    printf '\n==== QQ Farm Bot + NapCat ====\n'
+    printf '\n==== QQ Farm Bot + NapCat（脚本版本 %s）====\n' "$SCRIPT_VERSION"
     printf '1. 源码后台启动\n'
     printf '2. Docker 启动\n'
     printf '3. 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth\n'
