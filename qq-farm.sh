@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+shopt -s inherit_errexit
 
-# QQ Farm Bot + NapCat Linux 管理脚本
+# QQ Farm Bot + NapCat Linux 一键管理脚本
 # 放置方式：脚本放在项目根目录（与 core/、web/、package.json 同级）
 # ./qq-farm.sh
 # ./core/  ./web/  ./package.json
-# ./napcat/                 NapCat 安装、配置和数据目录（脚本所在目录内新建）
-# ./qq-miniapp-auth/       QQ 扫码授权服务（脚本所在目录内新建）
+# ./napcat/                 NapCat 安装包、配置、日志、状态（脚本所在目录内新建）
+# ./qq-miniapp-auth/        QQ 扫码授权服务（脚本所在目录内新建）
+#
+# NapCat 版本跟随 BUGDey/qq-farm-bot：v4.18.19
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # 兼容两种布局：脚本位于项目根内（当前仓库形态）或与 qq-farm-bot/ 目录同级
@@ -19,8 +22,7 @@ else
 fi
 NAPCAT_DIR="$ROOT_DIR/napcat"
 AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
-AUTH_REPO="https://github.com/liyangpengs/qq-miniapp-auth.git"
-AUTH_TARBALL_URL="https://codeload.github.com/liyangpengs/qq-miniapp-auth/tar.gz/refs/heads/master"
+AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-https://codeload.github.com/liyangpengs/qq-miniapp-auth/tar.gz/refs/heads/master}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
@@ -32,12 +34,32 @@ SOURCE_PID="$PROJECT_DIR/app_linux.pid"
 SOURCE_LOG="$PROJECT_DIR/app_linux.log"
 SOURCE_ERR="$PROJECT_DIR/app_linux.error.log"
 
+# NapCat 版本（与 BUGDey/qq-farm-bot 保持一致）
+NAPCAT_VERSION="${NAPCAT_VERSION:-v4.18.19}"
+NAPCAT_IMAGE="${NAPCAT_IMAGE:-mlikiowa/napcat-docker:v4.18.19}"
+NAPCAT_CONTAINER="${NAPCAT_CONTAINER:-qq-farm-napcat}"
+QQ_APP_DIR="${QQ_APP_DIR:-/opt/QQ/resources/app}"
+NAPCAT_LOG="$NAPCAT_DIR/napcat.log"
+NAPCAT_PID="$NAPCAT_DIR/napcat.pid"
+
 info(){ printf '\033[36m[INFO]\033[0m %s\n' "$*" >&2; }
 ok(){ printf '\033[32m[OK]\033[0m %s\n' "$*" >&2; }
 warn(){ printf '\033[33m[WARN]\033[0m %s\n' "$*" >&2; }
 die(){ printf '\033[31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
 need_project(){ [[ -d "$PROJECT_DIR" ]] || die "找不到项目目录：$PROJECT_DIR"; }
+
+if [[ ${EUID:-0} -eq 0 ]]; then IS_ROOT=1; else IS_ROOT=0; fi
+as_root(){
+  if [[ "$IS_ROOT" -eq 1 ]]; then "$@"; else sudo "$@"; fi
+}
+require_root_ability(){
+  if [[ "$IS_ROOT" -eq 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || die '当前不是 root 且没有 sudo，无法安装系统级 NapCat/LinuxQQ'
+  fi
+}
+
+# ---------------------------------------------------------------- 状态与配置
 
 load_state(){
   mkdir -p "$NAPCAT_DIR"
@@ -46,9 +68,11 @@ load_state(){
     source "$STATE_FILE"
   fi
   : "${API_ENDPOINT:=http://127.0.0.1:8787}"
-  : "${API_SECRET:=}"
+  : "${API_SECRET:=qq-miniapp-auth-default-signing-secret}"
   : "${ONEBOT_PORT:=3000}"
-  : "${NAPCAT_ROOT:=$NAPCAT_DIR}"
+  : "${ONEBOT_TOKEN:=}"
+  : "${NAPCAT_ROOT:=}"
+  : "${NAPCAT_MODE:=}"
 }
 
 save_state(){
@@ -58,18 +82,59 @@ API_ENDPOINT=$(printf '%q' "$API_ENDPOINT")
 API_SECRET=$(printf '%q' "$API_SECRET")
 ONEBOT_PORT=$(printf '%q' "$ONEBOT_PORT")
 ONEBOT_TOKEN=$(printf '%q' "$ONEBOT_TOKEN")
-NAPCAT_ROOT=$(printf '%q' "${NAPCAT_ROOT:-$NAPCAT_DIR}")
+NAPCAT_ROOT=$(printf '%q' "${NAPCAT_ROOT:-}")
+NAPCAT_MODE=$(printf '%q' "${NAPCAT_MODE:-}")
 EOF
 }
 
+# 全自动：不再交互提问，全部有默认值，可用环境变量覆盖
 read_settings(){
   load_state
-  if [[ -z "$API_ENDPOINT" ]]; then read -r -p 'qq-miniapp-auth API 地址 [http://127.0.0.1:8787]: ' API_ENDPOINT; API_ENDPOINT="${API_ENDPOINT:-http://127.0.0.1:8787}"; fi
-  if [[ -z "$API_SECRET" ]]; then read -r -p 'API_SIGNING_SECRET（必须与 qq-miniapp-auth 一致）: ' API_SECRET; API_SECRET="${API_SECRET:-qq-miniapp-auth-default-signing-secret}"; fi
-  if [[ -z "$ONEBOT_TOKEN" ]]; then ONEBOT_TOKEN="qq-farm-$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 32)"; fi
+  API_ENDPOINT="${API_ENDPOINT:-http://127.0.0.1:8787}"
+  API_SECRET="${API_SECRET:-qq-miniapp-auth-default-signing-secret}"
+  ONEBOT_PORT="${ONEBOT_PORT:-3000}"
+  if [[ -z "${ONEBOT_TOKEN:-}" ]]; then
+    ONEBOT_TOKEN="qq-farm-$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 32)"
+  fi
   [[ "$API_ENDPOINT" =~ ^https?:// ]] || die 'API 地址必须以 http:// 或 https:// 开头'
   save_state
 }
+
+# ---------------------------------------------------------------- 通用下载
+
+fetch_to(){
+  local dest="$1"; shift
+  local url
+  for url in "$@"; do
+    [[ -n "$url" ]] || continue
+    info "下载：$url"
+    if curl -fL --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 3600 -o "$dest.part" "$url"; then
+      mv "$dest.part" "$dest"
+      return 0
+    fi
+    warn "该地址下载失败，尝试下一个"
+  done
+  rm -f "$dest.part"
+  return 1
+}
+
+napcat_zip_urls(){
+  local v="$NAPCAT_VERSION"
+  [[ -n "${NAPCAT_ZIP_URL:-}" ]] && printf '%s\n' "$NAPCAT_ZIP_URL"
+  printf '%s\n' \
+    "https://ghfast.top/https://github.com/XingYunStar/NapCatQQ/releases/download/$v/NapCat.Shell.zip" \
+    "https://gh-proxy.com/https://github.com/XingYunStar/NapCatQQ/releases/download/$v/NapCat.Shell.zip" \
+    "https://ghproxy.net/https://github.com/XingYunStar/NapCatQQ/releases/download/$v/NapCat.Shell.zip" \
+    "https://github.com/XingYunStar/NapCatQQ/releases/download/$v/NapCat.Shell.zip"
+}
+
+pc_config_urls(){
+  printf '%s\n' \
+    "https://qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/pcConfig.json" \
+    "https://im.qq.com/proxy/domain/qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/pcConfig.json"
+}
+
+# ---------------------------------------------------------------- 源码 / Docker
 
 run_pnpm(){
   if command -v corepack >/dev/null 2>&1; then corepack pnpm "$@"
@@ -101,7 +166,7 @@ start_source(){
   echo "$pid" > "$SOURCE_PID"
   popd >/dev/null
   sleep 2
-  if ! kill -0 "$pid" 2>/dev/null; then die "源码进程启动后退出，请查看 $SOURCE_ERR"; fi
+  kill -0 "$pid" 2>/dev/null || die "源码进程启动后退出，请查看 $SOURCE_ERR"
   ok "源码已后台启动，PID=$pid"
   info "标准日志：$SOURCE_LOG"
   info "错误日志：$SOURCE_ERR"
@@ -114,37 +179,381 @@ start_docker(){
   ok 'Docker 已启动'
 }
 
-find_napcat_launcher(){
-  find "${NAPCAT_ROOT:-$NAPCAT_DIR}" -type f \( -name napcat -o -name napcat.sh -o -name launcher.sh -o -name NapCat.AppImage \) -print -quit 2>/dev/null || true
+# ---------------------------------------------------------------- LinuxQQ 客户端
+
+# 从官方 pcConfig.json 解析当前 LinuxQQ 下载地址；也可用 LINUXQQ_DEB_URL 直接指定
+resolve_linuxqq_url(){
+  local fmt="$1"
+  if [[ -n "${LINUXQQ_DEB_URL:-}" ]]; then
+    printf '%s\n' "$LINUXQQ_DEB_URL"
+    return 0
+  fi
+  local cfg="$TMPDIR/qq-pcConfig.$$.json"
+  local urls=()
+  mapfile -t urls < <(pc_config_urls)
+  fetch_to "$cfg" "${urls[@]}" || { rm -f "$cfg"; return 1; }
+  local arch url
+  arch="$(uname -m)"
+  url="$(node -e '
+const fs = require("fs");
+const [cfgPath, arch, fmt] = process.argv.slice(1);
+const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+const linux = cfg.Linux || {};
+const arm = /^(aarch64|arm64)$/.test(arch);
+const section = arm ? linux.armDownloadUrl : linux.x64DownloadUrl;
+if (!section) process.exit(2);
+const url = section[fmt] || section.deb || section.rpm || section.appimage;
+if (!url) process.exit(3);
+process.stdout.write(url);
+' "$cfg" "$arch" "$fmt" 2>/dev/null || true)"
+  rm -f "$cfg"
+  [[ -n "$url" ]] || return 1
+  printf '%s\n' "$url"
 }
 
-install_napcat(){
-  mkdir -p "$NAPCAT_DIR"
-  local launcher; launcher="$(find_napcat_launcher)"
-  [[ -n "$launcher" ]] && { printf '%s\n' "$launcher"; return; }
-  need curl; need unzip
-  info '下载 NapCat Linux 安装器…'
-  local installer="$NAPCAT_DIR/napcat-installer.sh"
-  curl -fL --connect-timeout 20 --max-time 1800 -o "$installer" 'https://raw.githubusercontent.com/NapNeko/NapCat-Installer/main/script/install.sh'
-  chmod +x "$installer"
-  info '开始运行 NapCat Linux 安装器（安装到当前用户目录；按提示完成 QQ/NapCat 初始化）'
-  bash "$installer" --docker n --cli y --github-proxy 0
-  launcher="$(find_napcat_launcher)"
-  if [[ -z "$launcher" ]]; then
-    warn "安装器已运行，但未在 $NAPCAT_DIR 找到启动器。请将 NapCat 根目录放到该目录或设置 NAPCAT_ROOT。"
+install_pkgs(){
+  (($#)) || return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    as_root apt-get update -qq || true
+    as_root apt-get install -y "$@" || return 1
+  elif command -v dnf >/dev/null 2>&1; then
+    as_root dnf install -y "$@" || return 1
+  elif command -v yum >/dev/null 2>&1; then
+    as_root yum install -y "$@" || return 1
   else
-    local root; root="$(dirname "$(find "${NAPCAT_ROOT:-$NAPCAT_DIR}" -type f -name napcat.mjs -print -quit 2>/dev/null || true)")"
-    if [[ -n "$root" && -f "$root/napcat.mjs" ]]; then NAPCAT_ROOT="$root"; save_state; fi
+    warn '未识别的包管理器，跳过系统依赖安装'
   fi
-  printf '%s\n' "$launcher"
 }
+
+install_qq_client(){
+  if [[ -x /opt/QQ/qq ]]; then
+    ok '已检测到 LinuxQQ：/opt/QQ/qq'
+    return 0
+  fi
+  require_root_ability
+  local fmt='deb'
+  if ! command -v dpkg >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then fmt='rpm'; fi
+  local url
+  url="$(resolve_linuxqq_url "$fmt" || true)"
+  if [[ -z "$url" ]]; then
+    die '无法获取 LinuxQQ 下载地址。可执行前设置 LINUXQQ_DEB_URL=<deb 直链> 后重试'
+  fi
+  info "LinuxQQ 安装包：$url"
+  local pkg="$TMPDIR/linuxqq.$$.$fmt"
+  fetch_to "$pkg" "$url" || die "LinuxQQ 下载失败：$url"
+  info '安装 LinuxQQ 运行依赖…'
+  install_pkgs curl unzip xvfb libnss3 libgbm1 >/dev/null 2>&1 || warn '部分依赖安装失败，继续尝试'
+  install_pkgs libasound2 >/dev/null 2>&1 || install_pkgs libasound2t64 >/dev/null 2>&1 || true
+  if [[ "$fmt" == 'deb' ]]; then
+    if ! as_root apt-get install -y "$pkg" >/dev/null 2>&1; then
+      as_root dpkg -i --force-depends "$pkg" || true
+      as_root apt-get install -f -y >/dev/null 2>&1 || true
+    fi
+  else
+    as_root rpm -Uvh --replacepkgs "$pkg" || as_root dnf install -y "$pkg" || true
+  fi
+  rm -f "$pkg"
+  [[ -x /opt/QQ/qq ]] || die 'LinuxQQ 安装后未找到 /opt/QQ/qq，请手动安装后重试'
+  ok 'LinuxQQ 安装完成'
+}
+
+# ---------------------------------------------------------------- NapCat 安装
+
+napcat_zip(){
+  local zip="$NAPCAT_DIR/NapCat.Shell.zip"
+  mkdir -p "$NAPCAT_DIR"
+  if [[ -s "$zip" ]] && unzip -tq "$zip" >/dev/null 2>&1; then
+    ok "已有可用 NapCat Shell 包：$zip"
+    printf '%s\n' "$zip"
+    return 0
+  fi
+  need curl; need unzip
+  local urls=()
+  mapfile -t urls < <(napcat_zip_urls)
+  rm -f "$zip"
+  fetch_to "$zip" "${urls[@]}" || die "NapCat Shell 包下载失败（可设置 NAPCAT_ZIP_URL 指定镜像）"
+  unzip -tq "$zip" >/dev/null 2>&1 || die '下载到的 NapCat.Shell.zip 校验失败'
+  ok "NapCat Shell 包下载完成（$NAPCAT_VERSION）：$zip"
+  printf '%s\n' "$zip"
+}
+
+patch_qq_main(){
+  local pkg_json="$1"
+  local node_bin; node_bin="$(command -v node)"
+  as_root "$node_bin" -e '
+const fs = require("fs");
+const p = process.argv[1];
+const obj = JSON.parse(fs.readFileSync(p, "utf8"));
+obj.main = "./loadNapCat.js";
+fs.writeFileSync(p + ".tmp", JSON.stringify(obj, null, 2) + "\n");
+fs.renameSync(p + ".tmp", p);
+' "$pkg_json"
+}
+
+# NapCat Shell 包内 qqnt.json 声明了它期望的 LinuxQQ 版本；
+# 官方客户端版本更新后，必须把 QQ 的 versions/config.json 对齐，否则 NapCat 无法挂载。
+patch_qq_version_config(){
+  local extract="$1"
+  need node
+  local qqnt="$extract/qqnt.json"
+  [[ -f "$qqnt" ]] || { warn 'NapCat 包内没有 qqnt.json，跳过版本对齐'; return 0; }
+  local target_ver target_hash
+  target_ver="$(node -e 'const j=require(process.argv[1]); process.stdout.write(j.linuxVersion||j.version||"")' "$qqnt" 2>/dev/null || true)"
+  target_hash="$(node -e 'const j=require(process.argv[1]); process.stdout.write(j.linuxVerHash||j.verHash||"")' "$qqnt" 2>/dev/null || true)"
+  if [[ -z "$target_ver" ]]; then
+    warn '无法解析 qqnt.json 中的 LinuxQQ 版本，跳过版本对齐'
+    return 0
+  fi
+  local build="${target_ver##*-}"
+  info "NapCat 期望的 LinuxQQ 版本：$target_ver（build $build）"
+  local node_bin; node_bin="$(command -v node)"
+  local confs=()
+  local home_dir
+  for home_dir in /root "/home/$(id -un)" "${HOME:-}"; do
+    [[ -n "$home_dir" && -f "$home_dir/.config/QQ/versions/config.json" ]] \
+      && confs+=("$home_dir/.config/QQ/versions/config.json")
+  done
+  if ((${#confs[@]} == 0)); then
+    # 还没登录过 QQ，先建好初始配置，避免挂载失败
+    local cfg_dir="${HOME:-/root}/.config/QQ/versions"
+    as_root mkdir -p "$cfg_dir"
+    echo '{}' | as_root tee "$cfg_dir/config.json" >/dev/null
+    confs=("$cfg_dir/config.json")
+  fi
+  local conf
+  for conf in "${confs[@]}"; do
+    as_root "$node_bin" -e '
+const fs = require("fs");
+const [path, ver, build, hashArg] = process.argv.slice(1);
+let obj = {};
+try { obj = JSON.parse(fs.readFileSync(path, "utf8")); } catch (e) { obj = {}; }
+obj.baseVersion = ver;
+obj.curVersion = ver;
+obj.buildId = build;
+if (hashArg) obj.hash = hashArg;
+fs.writeFileSync(path + ".tmp", JSON.stringify(obj, null, 2) + "\n");
+fs.renameSync(path + ".tmp", path);
+' "$conf" "$target_ver" "$build" "$target_hash"
+    ok "已对齐 QQ 版本配置：$conf"
+  done
+}
+
+install_napcat_native(){
+  need curl; need unzip; need node
+  require_root_ability
+  local zip; zip="$(napcat_zip)"
+  install_qq_client
+  local app_dir="$QQ_APP_DIR"
+  [[ -d "$app_dir" ]] || die "未找到 LinuxQQ 安装目录：$app_dir"
+  local target="$app_dir/app_launcher/napcat"
+  local extract="$NAPCAT_DIR/shell"
+  rm -rf "$extract"; mkdir -p "$extract"
+  unzip -q -o "$zip" -d "$extract"
+  [[ -f "$extract/napcat.mjs" ]] || die 'NapCat 包内缺少 napcat.mjs'
+  as_root mkdir -p "$target"
+  as_root cp -rf "$extract/." "$target/"
+  as_root chmod -R 755 "$target"
+  printf "(async () => {await import('file://%s/napcat.mjs');})();\n" "$target" \
+    | as_root tee "$app_dir/loadNapCat.js" >/dev/null
+  patch_qq_main "$app_dir/package.json"
+  patch_qq_version_config "$extract"
+  NAPCAT_ROOT="$target"
+  NAPCAT_MODE="native"
+  save_state
+  ok "NapCat Shell 已安装到：$target"
+  ok "已修补 $app_dir/package.json 的 main 指向 loadNapCat.js"
+}
+
+napcat_docker_entrypoint(){
+  cat > "$1" <<'ENTRY'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /app
+token_file=/app/napcat-auth/token
+mkdir -p "$(dirname "$token_file")"
+if [[ ! -s "$token_file" ]]; then
+  umask 077
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$token_file"
+fi
+NAPCAT_TOKEN="$(tr -d '\r\n' < "$token_file")"
+export WEBUI_TOKEN="${WEBUI_TOKEN:-$NAPCAT_TOKEN}"
+
+# 固化 WebUI 配置：qq-miniapp-auth 通过 NAPCAT_WEBUI_CONFIG 读取这里的 token
+webui_cfg=/app/napcat/config/webui.json
+if [[ ! -s "$webui_cfg" ]] && command -v jq >/dev/null 2>&1; then
+  mkdir -p "$(dirname "$webui_cfg")"
+  jq -n --arg token "$WEBUI_TOKEN" \
+    '{host: "0.0.0.0", port: 6099, token: $token, loginRate: 3}' > "$webui_cfg"
+fi
+
+if [[ ! -f /app/napcat/napcat.mjs ]]; then
+  if [[ -f /app/NapCat.Shell.zip ]]; then
+    unzip -q /app/NapCat.Shell.zip -d /app/NapCat.Shell
+    cp -rf /app/NapCat.Shell/* /app/napcat/
+    rm -rf /app/NapCat.Shell
+  else
+    for u in \
+      "https://ghfast.top/https://github.com/XingYunStar/NapCatQQ/releases/download/${NAPCAT_VERSION:-v4.18.19}/NapCat.Shell.zip" \
+      "https://gh-proxy.com/https://github.com/XingYunStar/NapCatQQ/releases/download/${NAPCAT_VERSION:-v4.18.19}/NapCat.Shell.zip" \
+      "https://github.com/XingYunStar/NapCatQQ/releases/download/${NAPCAT_VERSION:-v4.18.19}/NapCat.Shell.zip"; do
+      if curl -fL --connect-timeout 20 --max-time 1800 -o /tmp/NapCat.Shell.zip "$u"; then break; fi
+    done
+    unzip -q /tmp/NapCat.Shell.zip -d /app/NapCat.Shell
+    cp -rf /app/NapCat.Shell/* /app/napcat/
+    rm -rf /app/NapCat.Shell /tmp/NapCat.Shell.zip
+  fi
+fi
+
+if [[ -d /opt/qq-farm/qq-miniapp-openauth ]]; then
+  rm -rf /app/napcat/plugins/qq-miniapp-openauth
+  mkdir -p /app/napcat/plugins
+  cp -a /opt/qq-farm/qq-miniapp-openauth /app/napcat/plugins/
+  if ! grep -Fq '"qq-miniapp-openauth"' /app/napcat/napcat.mjs; then
+    if grep -Fq '"napcat-plugin-qce"' /app/napcat/napcat.mjs; then
+      sed -i '0,/"napcat-plugin-qce"/s//"napcat-plugin-qce",\n  "qq-miniapp-openauth"/' /app/napcat/napcat.mjs
+    else
+      echo "NapCat plugin whitelist marker not found" >&2
+    fi
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    plugin_config=/app/napcat/config/plugins/qq-miniapp-openauth/config.json
+    mkdir -p "$(dirname "$plugin_config")"
+    jq -n --arg token "$NAPCAT_TOKEN" '{token: $token}' > "$plugin_config.tmp"
+    mv "$plugin_config.tmp" "$plugin_config"
+    chmod 600 "$plugin_config"
+    plugins_config=/app/napcat/config/plugins.json
+    if [[ -s "$plugins_config" ]] && jq empty "$plugins_config" 2>/dev/null; then
+      jq '. + {"qq-miniapp-openauth": true}' "$plugins_config" > "$plugins_config.tmp"
+    else
+      jq -n '{"qq-miniapp-openauth": true}' > "$plugins_config.tmp"
+    fi
+    mv "$plugins_config.tmp" "$plugins_config"
+  fi
+fi
+
+exec bash /app/entrypoint.sh "$@"
+ENTRY
+}
+
+napcat_image_tar_urls(){
+  local arch name
+  case "$(uname -m)" in
+    x86_64|amd64) arch='amd64' ;;
+    aarch64|arm64) arch='arm64' ;;
+    *) return 0 ;;
+  esac
+  name="napcat-docker-${NAPCAT_VERSION}-${arch}.tar"
+  printf '%s\n' \
+    "https://ghfast.top/https://github.com/XingYunStar/NapCatQQ/releases/download/$NAPCAT_VERSION/$name" \
+    "https://gh-proxy.com/https://github.com/XingYunStar/NapCatQQ/releases/download/$NAPCAT_VERSION/$name" \
+    "https://ghproxy.net/https://github.com/XingYunStar/NapCatQQ/releases/download/$NAPCAT_VERSION/$name" \
+    "https://github.com/XingYunStar/NapCatQQ/releases/download/$NAPCAT_VERSION/$name"
+}
+
+# 确保基础镜像在本地：优先复用，其次 docker pull，最后用官方 release 的离线 tar 包 docker load
+ensure_napcat_base_image(){
+  if docker image inspect "$NAPCAT_IMAGE" >/dev/null 2>&1; then
+    ok "已存在基础镜像：$NAPCAT_IMAGE"
+    return 0
+  fi
+  info "尝试拉取基础镜像：$NAPCAT_IMAGE"
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 60 docker pull "$NAPCAT_IMAGE" || rc=$?
+  else
+    docker pull "$NAPCAT_IMAGE" || rc=$?
+  fi
+  if ((rc == 0)) && docker image inspect "$NAPCAT_IMAGE" >/dev/null 2>&1; then
+    ok "基础镜像拉取完成：$NAPCAT_IMAGE"
+    return 0
+  fi
+  warn '无法直接从镜像仓库拉取，改用官方离线包（与 BUGDey 使用的版本一致）'
+  need curl
+  local arch_tar
+  case "$(uname -m)" in
+    x86_64|amd64) arch_tar='amd64' ;;
+    aarch64|arm64) arch_tar='arm64' ;;
+    *) die "不支持的 CPU 架构：$(uname -m)，请手动设置 NAPCAT_IMAGE" ;;
+  esac
+  local urls=() tarfile
+  mapfile -t urls < <(napcat_image_tar_urls)
+  tarfile="$NAPCAT_DIR/napcat-docker-${NAPCAT_VERSION}-${arch_tar}.tar"
+  if [[ ! -s "$tarfile" ]]; then
+    fetch_to "$tarfile" "${urls[@]}" || die 'NapCat 离线镜像包下载失败（可用 NAPCAT_IMAGE 指定自建镜像）'
+  else
+    ok "已有离线镜像包：$tarfile"
+  fi
+  info '导入离线镜像（文件较大，请耐心等待）…'
+  local load_out
+  load_out="$(docker load -i "$tarfile" 2>&1)" || die "docker load 失败：$tarfile"
+  printf '%s\n' "$load_out" | grep -E '^Loaded image' >&2 || true
+  if ! docker image inspect "$NAPCAT_IMAGE" >/dev/null 2>&1; then
+    # 离线包里的仓库名可能与 NAPCAT_IMAGE 不同，把刚导入的镜像重新打标签
+    local loaded_ref
+    loaded_ref="$(printf '%s\n' "$load_out" | sed -n 's/^Loaded image: //p' | head -n1)"
+    [[ -n "$loaded_ref" ]] || loaded_ref="$(printf '%s\n' "$load_out" | sed -n 's/^Loaded image ID: //p' | head -n1)"
+    [[ -n "$loaded_ref" ]] || die 'docker load 成功但无法识别镜像名，请手动 docker tag 后重试'
+    docker tag "$loaded_ref" "$NAPCAT_IMAGE" \
+      || die "无法将 $loaded_ref 标记为 $NAPCAT_IMAGE"
+    info "已将 $loaded_ref 标记为 $NAPCAT_IMAGE"
+  fi
+  ok "基础镜像已导入：$NAPCAT_IMAGE"
+}
+
+install_napcat_docker(){
+  need docker
+  docker info >/dev/null 2>&1 || die 'Docker 未运行或当前用户无权访问 Docker'
+  read_settings
+  ensure_napcat_base_image
+  install_auth_service
+  local ctx="$NAPCAT_DIR/docker"
+  rm -rf "$ctx"; mkdir -p "$ctx"
+  if [[ -d "$AUTH_DIR/napcat-openauth-plugin" ]]; then
+    cp -a "$AUTH_DIR/napcat-openauth-plugin" "$ctx/qq-miniapp-openauth"
+  else
+    warn '未找到 napcat-openauth-plugin，容器内将跳过插件安装'
+    mkdir -p "$ctx/qq-miniapp-openauth"
+  fi
+  napcat_docker_entrypoint "$ctx/entrypoint.sh"
+  cat > "$ctx/Dockerfile" <<'DOCKER'
+ARG NAPCAT_IMAGE=mlikiowa/napcat-docker:v4.18.19
+FROM ${NAPCAT_IMAGE}
+ENV NAPCAT_VERSION=""
+COPY qq-miniapp-openauth /opt/qq-farm/qq-miniapp-openauth
+COPY entrypoint.sh /usr/local/bin/qq-farm-napcat-entrypoint
+RUN chmod +x /usr/local/bin/qq-farm-napcat-entrypoint || true
+ENTRYPOINT ["/usr/local/bin/qq-farm-napcat-entrypoint"]
+DOCKER
+  info "构建 NapCat 容器镜像（基础镜像 $NAPCAT_IMAGE）…"
+  docker build --build-arg NAPCAT_IMAGE="$NAPCAT_IMAGE" -t qq-farm-napcat:local "$ctx"
+  mkdir -p "$NAPCAT_DIR/config" "$NAPCAT_DIR/QQ" "$NAPCAT_DIR/auth"
+  docker rm -f "$NAPCAT_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$NAPCAT_CONTAINER" --restart unless-stopped \
+    -e NAPCAT_UID=0 -e NAPCAT_GID=0 \
+    -e NAPCAT_TOKEN="$ONEBOT_TOKEN" -e WEBUI_TOKEN="$ONEBOT_TOKEN" \
+    -e NAPCAT_VERSION="$NAPCAT_VERSION" \
+    -p "127.0.0.1:6099:6099" -p "127.0.0.1:${ONEBOT_PORT}:3000" \
+    -v "$NAPCAT_DIR/config:/app/napcat/config" \
+    -v "$NAPCAT_DIR/QQ:/app/.config/QQ" \
+    -v "$NAPCAT_DIR/auth:/app/napcat-auth" \
+    qq-farm-napcat:local >/dev/null
+  NAPCAT_MODE="docker"
+  NAPCAT_ROOT="$NAPCAT_DIR"
+  save_state
+  sleep 3
+  docker ps --filter "name=$NAPCAT_CONTAINER" --format '{{.Status}}' | grep -q Up \
+    || die "NapCat 容器未正常运行，请查看：docker logs $NAPCAT_CONTAINER"
+  ok "NapCat 容器已启动：$NAPCAT_CONTAINER（WebUI 127.0.0.1:6099，OneBot 127.0.0.1:$ONEBOT_PORT）"
+}
+
+# ---------------------------------------------------------------- 授权服务
 
 install_auth_service(){
   need_project; need curl; need tar; need node
   if [[ ! -d "$AUTH_DIR" ]]; then
     info '下载 qq-miniapp-auth 源码…'
     local tmp="$TMPDIR/qq-miniapp-auth.$$.tar.gz"
-    curl -fL --connect-timeout 20 --max-time 1800 -o "$tmp" "$AUTH_TARBALL_URL"
+    fetch_to "$tmp" "$AUTH_TARBALL_URL" || die 'qq-miniapp-auth 源码下载失败'
     mkdir -p "$ROOT_DIR/.auth-extract"
     tar -xzf "$tmp" -C "$ROOT_DIR/.auth-extract"
     local extracted
@@ -159,197 +568,241 @@ install_auth_service(){
     else : > "$AUTH_DIR/.env"; fi
   fi
   read_settings
-  python3 - "$AUTH_DIR/.env" "$API_SECRET" "$ONEBOT_TOKEN" <<'PY'
-import pathlib, re, sys
-path, secret, onebot = sys.argv[1:]
-p=pathlib.Path(path)
-s=p.read_text(encoding='utf-8') if p.exists() else ''
-values={
- 'HOST':'127.0.0.1',
- 'PORT':'8787',
- 'NAPCAT_API_URL':'http://127.0.0.1:3000',
- 'NAPCAT_TOKEN':onebot,
- 'NAPCAT_OPEN_AUTH_PLUGIN_URL':'http://127.0.0.1:6099/plugin/qq-miniapp-openauth/api',
- 'NAPCAT_OPEN_AUTH_PLUGIN_TOKEN':'',
- 'NAPCAT_WEBUI_API_URL':'http://127.0.0.1:6099/api',
- 'BRIDGE_HOST':'127.0.0.1',
- 'BRIDGE_PORT':'9010',
- 'API_SIGNING_SECRET':secret,
+  local webui_config="${NAPCAT_ROOT:-$NAPCAT_DIR}/config/webui.json"
+  node -e '
+const fs = require("fs");
+const [path, secret, onebot, webuiCfg, onebotPort] = process.argv.slice(1);
+let s = fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
+const values = {
+  HOST: "127.0.0.1",
+  PORT: "8787",
+  NAPCAT_API_URL: "http://127.0.0.1:" + onebotPort,
+  NAPCAT_TOKEN: onebot,
+  NAPCAT_OPEN_AUTH_PLUGIN_URL: "http://127.0.0.1:6099/plugin/qq-miniapp-openauth/api",
+  NAPCAT_WEBUI_API_URL: "http://127.0.0.1:6099/api",
+  NAPCAT_WEBUI_CONFIG: webuiCfg,
+  BRIDGE_HOST: "127.0.0.1",
+  BRIDGE_PORT: "9010",
+  API_SIGNING_SECRET: secret,
+  MINIAPP_SECRETS: "{}",
+};
+for (const [k, v] of Object.entries(values)) {
+  const re = new RegExp("^" + k + "=.*$", "m");
+  const line = k + "=" + v;
+  if (re.test(s)) s = s.replace(re, line);
+  else s += (s === "" || s.endsWith("\n") ? "" : "\n") + line + "\n";
 }
-for key,value in values.items():
-    line=f'{key}={value}'
-    pattern=rf'^{re.escape(key)}=.*$'
-    if re.search(pattern,s,re.M): s=re.sub(pattern,line,s,flags=re.M)
-    else: s += ('' if not s or s.endswith('\n') else '\n') + line + '\n'
-p.write_text(s,encoding='utf-8')
-PY
-  pushd "$AUTH_DIR" >/dev/null
-  if [[ -f package-lock.json ]]; then npm ci; else npm install; fi
-  popd >/dev/null
+fs.writeFileSync(path, s);
+' "$AUTH_DIR/.env" "$API_SECRET" "$ONEBOT_TOKEN" "$webui_config" "$ONEBOT_PORT"
+  chmod 600 "$AUTH_DIR/.env" 2>/dev/null || true
+  if [[ -d "$AUTH_DIR/node_modules" && -f "$AUTH_DIR/node_modules/.package-lock.json" ]]; then
+    ok "qq-miniapp-auth 依赖已安装，跳过 npm install"
+  else
+    pushd "$AUTH_DIR" >/dev/null
+    if [[ -f package-lock.json ]]; then npm ci --omit=dev
+    else npm install --omit=dev; fi
+    popd >/dev/null
+  fi
   ok "qq-miniapp-auth 已准备：$AUTH_DIR"
 }
 
 start_auth_service(){
   install_auth_service
   local pid_file="$AUTH_DIR/qq-miniapp-auth.pid"
-  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then ok "qq-miniapp-auth 已在后台运行，PID $(cat "$pid_file")"; return; fi
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    ok "qq-miniapp-auth 已在后台运行，PID $(cat "$pid_file")"
+    return
+  fi
   local log="$AUTH_DIR/qq-miniapp-auth.log"
   pushd "$AUTH_DIR" >/dev/null
   nohup npm start >>"$log" 2>&1 </dev/null &
   local pid=$!
   echo "$pid" > "$pid_file"
   popd >/dev/null
-  sleep 2
+  sleep 3
   kill -0 "$pid" 2>/dev/null || die "qq-miniapp-auth 启动失败，请查看 $log"
   ok "qq-miniapp-auth 已后台启动，PID=$pid，日志：$log"
 }
 
+# ---------------------------------------------------------------- 插件安装
+
 install_napcat_plugin(){
-  install_auth_service
-  need curl
-  local napcat_root
-  napcat_root="${NAPCAT_ROOT:-$NAPCAT_DIR}"
-  if [[ ! -f "$napcat_root/napcat.mjs" ]]; then
-    local candidate
-    candidate="$(find "$napcat_root" -type f -name napcat.mjs -print -quit 2>/dev/null || true)"
-    [[ -n "$candidate" ]] && napcat_root="$(dirname "$candidate")"
+  need node
+  read_settings
+  local napcat_root="${NAPCAT_ROOT:-}"
+  if [[ -z "$napcat_root" ]]; then
+    if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then napcat_root="$NAPCAT_DIR"; else napcat_root="$QQ_APP_DIR/app_launcher/napcat"; fi
+  fi
+  if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
+    # 镜像内已带插件，entrypoint 每次启动都会刷新插件目录与白名单
+    ok 'NapCat 容器内插件由 entrypoint 自动安装，无需额外操作'
+    return 0
   fi
   [[ -f "$napcat_root/napcat.mjs" ]] || die "找不到 NapCat 根目录中的 napcat.mjs：$napcat_root"
   [[ -d "$AUTH_DIR/napcat-openauth-plugin" ]] || die 'qq-miniapp-auth 中缺少 napcat-openauth-plugin'
   info '安装 qq-miniapp-openauth NapCat 插件…'
   local plugin_dir="$napcat_root/plugins/qq-miniapp-openauth"
-  local plugin_cfg_dir="$napcat_root/config/plugins/qq-miniapp-openauth"
-  mkdir -p "$plugin_dir" "$plugin_cfg_dir"
-  cp -a "$AUTH_DIR/napcat-openauth-plugin/." "$plugin_dir/"
+  local plugin_cfg="$napcat_root/config/plugins/qq-miniapp-openauth/config.json"
+  as_root mkdir -p "$plugin_dir" "$(dirname "$plugin_cfg")"
+  as_root cp -a "$AUTH_DIR/napcat-openauth-plugin/." "$plugin_dir/"
   local token
   token="$(grep -E '^NAPCAT_OPEN_AUTH_PLUGIN_TOKEN=' "$AUTH_DIR/.env" | head -n1 | cut -d= -f2- || true)"
-  if [[ -z "$token" ]]; then token="$(node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64"))')"; fi
-  printf '{\n  "token": %s\n}\n' "$(printf '%s' "$token" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" > "$plugin_cfg_dir/config.json"
-  chmod 600 "$plugin_cfg_dir/config.json"
-  python3 - "$napcat_root/config/plugins.json" <<'PY'
-import json, pathlib, sys
-p=pathlib.Path(sys.argv[1]); obj={}
-if p.exists():
-    try: obj=json.loads(p.read_text(encoding='utf-8'))
-    except Exception: obj={}
-obj['qq-miniapp-openauth']=True
-p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps(obj,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-PY
-  python3 - "$AUTH_DIR/.env" "$token" <<'PY'
-import pathlib,re,sys
-p=pathlib.Path(sys.argv[1]); token=sys.argv[2]; s=p.read_text(encoding='utf-8')
-line='NAPCAT_OPEN_AUTH_PLUGIN_TOKEN='+token
-if re.search(r'^NAPCAT_OPEN_AUTH_PLUGIN_TOKEN=.*$',s,re.M): s=re.sub(r'^NAPCAT_OPEN_AUTH_PLUGIN_TOKEN=.*$',line,s,flags=re.M)
-else: s += ('' if not s.endswith('\n') else '') + line+'\n'
-p.write_text(s,encoding='utf-8')
-PY
+  [[ -n "$token" ]] || token="$ONEBOT_TOKEN"
+  node -e '
+const fs = require("fs");
+const [out, token] = process.argv.slice(1);
+fs.writeFileSync(out, JSON.stringify({ token }, null, 2) + "\n");
+' "$TMPDIR/plugin-config.$$.json" "$token"
+  as_root cp "$TMPDIR/plugin-config.$$.json" "$plugin_cfg"
+  as_root chmod 600 "$plugin_cfg"
+  rm -f "$TMPDIR/plugin-config.$$.json"
+  node -e '
+const fs = require("fs");
+const p = process.argv[1];
+let obj = {};
+try { obj = JSON.parse(fs.readFileSync(p, "utf8")); } catch (e) { obj = {}; }
+obj["qq-miniapp-openauth"] = true;
+fs.mkdirSync(require("path").dirname(p), { recursive: true });
+fs.writeFileSync(p, JSON.stringify(obj, null, 2) + "\n");
+' "$napcat_root/config/plugins.json"
   if ! grep -Fq '"qq-miniapp-openauth"' "$napcat_root/napcat.mjs"; then
-    grep -Fq '"napcat-plugin-qce"' "$napcat_root/napcat.mjs" || die 'napcat.mjs 中找不到官方插件白名单标记，拒绝自动修改'
-    cp -a "$napcat_root/napcat.mjs" "$napcat_root/napcat.mjs.bak.$(date +%Y%m%d%H%M%S)"
-    python3 - "$napcat_root/napcat.mjs" <<'PY'
-from pathlib import Path
-import sys
-p=Path(sys.argv[1]); s=p.read_text(encoding='utf-8')
-marker='"napcat-plugin-qce"'; plugin='"qq-miniapp-openauth"'; i=s.find(marker)
-if i < 0: raise SystemExit('plugin whitelist marker not found')
-s=s[:i+len(marker)]+',\n '+plugin+s[i+len(marker):]
-p.write_text(s,encoding='utf-8')
-PY
+    grep -Fq '"napcat-plugin-qce"' "$napcat_root/napcat.mjs" \
+      || die 'napcat.mjs 中找不到官方插件白名单标记，拒绝自动修改'
+    as_root cp -a "$napcat_root/napcat.mjs" "$napcat_root/napcat.mjs.bak.$(date +%Y%m%d%H%M%S)"
+    node -e '
+const fs = require("fs");
+const [src, dst] = process.argv.slice(1);
+let s = fs.readFileSync(src, "utf8");
+const marker = "\"napcat-plugin-qce\"";
+const plugin = "\"qq-miniapp-openauth\"";
+const i = s.indexOf(marker);
+if (i < 0) { console.error("plugin whitelist marker not found"); process.exit(1); }
+s = s.slice(0, i + marker.length) + ",\n  " + plugin + s.slice(i + marker.length);
+fs.writeFileSync(dst, s);
+' "$napcat_root/napcat.mjs" "$TMPDIR/napcat-patch.$$.mjs"
+    as_root cp "$TMPDIR/napcat-patch.$$.mjs" "$napcat_root/napcat.mjs"
+    rm -f "$TMPDIR/napcat-patch.$$.mjs"
   fi
-
+  node -e '
+const fs = require("fs");
+const [envPath, token] = process.argv.slice(1);
+let s = fs.readFileSync(envPath, "utf8");
+const line = "NAPCAT_OPEN_AUTH_PLUGIN_TOKEN=" + token;
+const re = /^NAPCAT_OPEN_AUTH_PLUGIN_TOKEN=.*$/m;
+s = re.test(s) ? s.replace(re, line) : s + (s.endsWith("\n") ? "" : "\n") + line + "\n";
+fs.writeFileSync(envPath, s);
+' "$AUTH_DIR/.env" "$token"
   NAPCAT_ROOT="$napcat_root"
   save_state
-  ok "qq-miniapp-openauth 插件已安装到：$plugin_dir"
-  ok '插件白名单和 plugins.json 已更新；请重启 NapCat 后验证插件状态。'
+  ok "qq-miniapp-openauth 插件已安装：$plugin_dir"
 }
 
-start_official_qq_mode(){
-  need_project
-  [[ -f "$PROJECT_DIR/start.sh" ]] || die "当前项目没有官方 start.sh：$PROJECT_DIR/start.sh"
-  chmod +x "$PROJECT_DIR/start.sh"
-  info '调用 QQ Farm Bot 官方 Linux QQ 扫码部署流程：start.sh 2'
-  (cd "$PROJECT_DIR" && ./start.sh 2)
-  ok '官方 QQ 扫码部署流程已结束；请按输出打开 NapCat WebUI 完成扫码。'
-}
+# ---------------------------------------------------------------- OneBot / 农场配置
 
-start_official_default_mode(){
-  need_project
-  [[ -f "$PROJECT_DIR/start.sh" ]] || die "当前项目没有官方 start.sh：$PROJECT_DIR/start.sh"
-  chmod +x "$PROJECT_DIR/start.sh"
-  info '调用 QQ Farm Bot 官方 Linux默认部署流程：start.sh 1'
-  (cd "$PROJECT_DIR" && ./start.sh 1)
+find_onebot_configs(){
+  local root="${NAPCAT_ROOT:-$NAPCAT_DIR}"
+  find "$root/config" -maxdepth 1 -type f -name 'onebot11*.json' 2>/dev/null || true
 }
-
 
 configure_onebot_file(){
-  local file="$1"
-  need python3
-  python3 - "$file" "$ONEBOT_PORT" "$ONEBOT_TOKEN" <<'PY'
-import json, sys
-path, port, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-try:
-    with open(path, encoding='utf-8-sig') as f: obj=json.load(f)
-except Exception:
-    obj={}
-network=obj.setdefault('network', {})
-servers=network.setdefault('httpServers', [])
-server=next((x for x in servers if x.get('name') == 'qq-miniapp-auth-onebot'), None)
-if server is None:
-    server={'name':'qq-miniapp-auth-onebot','enable':True,'host':'127.0.0.1','port':port,'token':token,'enableCors':False,'enableWebsocket':False,'messagePostFormat':'array','debug':False}
-    servers.append(server)
-else:
-    server.update(enable=True, host='127.0.0.1', port=port, token=token)
-for key in ('httpClients','websocketServers','websocketClients'):
-    network.setdefault(key, [])
-with open(path, 'w', encoding='utf-8') as f:
-    json.dump(obj, f, ensure_ascii=False, indent=2)
-    f.write('\n')
-PY
+  local file="$1" bind_host="${2:-127.0.0.1}"
+  node -e '
+const fs = require("fs");
+const [path, port, token, bindHost] = process.argv.slice(1);
+let obj = {};
+try { obj = JSON.parse(fs.readFileSync(path, "utf8").replace(/^\uFEFF/, "")); } catch (e) { obj = {}; }
+const network = obj.network = obj.network || {};
+const servers = network.httpServers = network.httpServers || [];
+let server = servers.find((x) => x && x.name === "qq-miniapp-auth-onebot");
+if (!server) {
+  server = {
+    name: "qq-miniapp-auth-onebot",
+    enable: true,
+    host: bindHost,
+    port: Number(port),
+    token,
+    enableCors: false,
+    enableWebsocket: false,
+    messagePostFormat: "array",
+    debug: false,
+  };
+  servers.push(server);
+} else {
+  Object.assign(server, { enable: true, host: bindHost, port: Number(port), token });
+}
+for (const k of ["httpClients", "websocketServers", "websocketClients"]) {
+  if (!Array.isArray(network[k])) network[k] = [];
+}
+fs.mkdirSync(require("path").dirname(path), { recursive: true });
+fs.writeFileSync(path, JSON.stringify(obj, null, 2) + "\n");
+' "$file" "$ONEBOT_PORT" "$ONEBOT_TOKEN" "$bind_host"
 }
 
 configure_napcat(){
   read_settings
-  NAPCAT_ROOT="${NAPCAT_ROOT:-$NAPCAT_DIR}"
+  local files=()
   mapfile -t files < <(find_onebot_configs)
   if ((${#files[@]} == 0)); then
-    mkdir -p "$NAPCAT_DIR/config"
-    files=("$NAPCAT_DIR/config/onebot11.json")
+    local cfg_dir
+    if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then cfg_dir="$NAPCAT_DIR/config"; else cfg_dir="${NAPCAT_ROOT:-$QQ_APP_DIR/app_launcher/napcat}/config"; fi
+    mkdir -p "$cfg_dir"
+    files=("$cfg_dir/onebot11.json")
   fi
-  local file; for file in "${files[@]}"; do configure_onebot_file "$file"; done
+  local file
+  for file in "${files[@]}"; do
+    if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
+      # 容器内的 OneBot 必须绑定 0.0.0.0，否则宿主机端口映射访问不到；
+      # config 目录是 volume，直接写宿主侧文件即可，容器重启后生效
+      mkdir -p "$(dirname "$file")"
+      configure_onebot_file "$file" '0.0.0.0'
+    else
+      as_root mkdir -p "$(dirname "$file")"
+      if [[ -w "$(dirname "$file")" ]]; then configure_onebot_file "$file"
+      else
+        local tmp="$TMPDIR/onebot.$$.json"
+        configure_onebot_file "$tmp"
+        as_root cp "$tmp" "$file"
+        rm -f "$tmp"
+      fi
+    fi
+  done
   ok "NapCat OneBot HTTP 服务已配置：127.0.0.1:$ONEBOT_PORT"
   info "qq-miniapp-auth API 地址：$API_ENDPOINT"
+  if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
+    # 配置是通过 docker cp 写进去的，重启容器让它重新加载
+    docker restart "$NAPCAT_CONTAINER" >/dev/null 2>&1 || warn 'NapCat 容器重启失败，请手动执行 docker restart'
+    sleep 3
+    ok 'NapCat 容器已重启以加载 OneBot 配置'
+  fi
 }
 
 update_farm_store(){
   local file="$1"
-  need python3
-  mkdir -p "$(dirname "$file")"
-  python3 - "$file" "$API_ENDPOINT" "$API_SECRET" <<'PY'
-import json, os, sys
-path, endpoint, secret = sys.argv[1:]
-try:
-    with open(path, encoding='utf-8-sig') as f: obj=json.load(f)
-except Exception:
-    obj={}
-login=obj.setdefault('loginSettings', {})
-login.update(qqQrLogin=True, napCatEndpoint=endpoint, napCatSignature=secret)
-tmp=path+'.tmp'
-with open(tmp,'w',encoding='utf-8') as f:
-    json.dump(obj,f,ensure_ascii=False,indent=2); f.write('\n')
-os.replace(tmp,path)
-PY
+  node -e '
+const fs = require("fs");
+const [path, endpoint, secret] = process.argv.slice(1);
+let obj = {};
+try { obj = JSON.parse(fs.readFileSync(path, "utf8").replace(/^\uFEFF/, "")); } catch (e) { obj = {}; }
+const login = obj.loginSettings = obj.loginSettings || {};
+Object.assign(login, { qqQrLogin: true, napCatEndpoint: endpoint, napCatSignature: secret });
+fs.mkdirSync(require("path").dirname(path), { recursive: true });
+fs.writeFileSync(path + ".tmp", JSON.stringify(obj, null, 2) + "\n");
+fs.renameSync(path + ".tmp", path);
+' "$file" "$API_ENDPOINT" "$API_SECRET"
 }
 
-configure_source(){ read_settings; update_farm_store "$FARM_STORE"; ok '源码模式 QQ 扫码登录配置已写入 core/data/store.json'; }
+configure_source(){
+  read_settings
+  update_farm_store "$FARM_STORE"
+  ok '源码模式 QQ 扫码登录配置已写入 core/data/store.json'
+}
 
 configure_docker(){
-  local host_ip="${NAPCAT_HOST_IP:-host.docker.internal}"
-  local docker_api="http://${host_ip}:${ONEBOT_PORT}"
-  local docker_env="$AUTH_DIR/.env.docker"
-  cp "$AUTH_DIR/.env" "$docker_env"
-  sed -i -E "s#^NAPCAT_API_URL=.*#NAPCAT_API_URL=$docker_api#" "$docker_env"
+  read_settings
   local tmp="$TMPDIR/qq-farm-store.$$.json"
-  if ! docker cp "$CONTAINER_NAME:/app/core/data/store.json" "$tmp" >/dev/null 2>&1; then echo '{}' > "$tmp"; fi
+  if ! docker cp "$CONTAINER_NAME:/app/core/data/store.json" "$tmp" >/dev/null 2>&1; then
+    echo '{}' > "$tmp"
+  fi
   update_farm_store "$tmp"
   docker cp "$tmp" "$CONTAINER_NAME:/app/core/data/store.json" >/dev/null
   docker restart "$CONTAINER_NAME" >/dev/null
@@ -357,47 +810,129 @@ configure_docker(){
   ok 'Docker 模式 QQ 扫码登录配置已写入并重启容器'
 }
 
-start_napcat(){
-  local launcher="${1:-}"; launcher="${launcher:-$(find_napcat_launcher)}"
-  if [[ -n "$launcher" ]]; then
-    chmod +x "$launcher" 2>/dev/null || true
-    nohup "$launcher" >/dev/null 2>&1 </dev/null &
-    ok "NapCat 已后台启动：$launcher"
-  else warn "未找到 NapCat 启动器，请检查 $NAPCAT_DIR"; fi
+# ---------------------------------------------------------------- 启停
+
+start_napcat_native(){
+  if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
+    docker start "$NAPCAT_CONTAINER" >/dev/null 2>&1 || true
+    sleep 2
+    docker ps --filter "name=$NAPCAT_CONTAINER" --format '{{.Status}}' | grep -q Up \
+      && ok "NapCat 容器已运行：$NAPCAT_CONTAINER" || die "NapCat 容器启动失败：docker logs $NAPCAT_CONTAINER"
+    return 0
+  fi
+  local qq='/opt/QQ/qq'
+  [[ -x "$qq" ]] || qq="$(command -v qq || true)"
+  [[ -n "$qq" ]] || die '未找到 QQ 可执行文件（/opt/QQ/qq）'
+  if [[ -f "$NAPCAT_PID" ]] && kill -0 "$(cat "$NAPCAT_PID" 2>/dev/null || echo 0)" 2>/dev/null; then
+    ok "NapCat 已在运行，PID $(cat "$NAPCAT_PID")"
+    return 0
+  fi
+  : > "$NAPCAT_LOG"
+  if command -v xvfb-run >/dev/null 2>&1; then
+    nohup xvfb-run -a "$qq" --no-sandbox >>"$NAPCAT_LOG" 2>&1 </dev/null &
+  else
+    warn '未安装 xvfb-run，尝试直接启动（无 X 显示环境时可能失败）'
+    nohup "$qq" --no-sandbox >>"$NAPCAT_LOG" 2>&1 </dev/null &
+  fi
+  disown 2>/dev/null || true
+  sleep 6
+  # xvfb-run / setsid 可能再 fork，不能用 $! 判定存活，改为按进程名确认
+  local real_pid
+  real_pid="$(pgrep -f "xvfb-run -a $qq" 2>/dev/null | head -n1 || true)"
+  [[ -n "$real_pid" ]] || real_pid="$(pgrep -x qq 2>/dev/null | head -n1 || true)"
+  [[ -n "$real_pid" ]] || die "NapCat 启动后未存活，请查看 $NAPCAT_LOG"
+  echo "$real_pid" > "$NAPCAT_PID"
+  ok "NapCat 已后台启动，PID=$real_pid，日志：$NAPCAT_LOG"
+  info '首次启动后请打开 NapCat WebUI 扫码登录 QQ：http://127.0.0.1:6099/webui/'
 }
 
 restart_napcat(){
-  pkill -f 'napcat|NapCat|qq' 2>/dev/null || true
+  load_state
+  if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
+    docker restart "$NAPCAT_CONTAINER" >/dev/null
+    ok "NapCat 容器已重启：$NAPCAT_CONTAINER"
+    return 0
+  fi
+  # 仅结束脚本自己拉起的 NapCat（xvfb-run 包装进程 + qq 主进程），不做全局 pkill
+  local qq_bin='/opt/QQ/qq'
+  local pid
+  if [[ -f "$NAPCAT_PID" ]]; then
+    pid="$(cat "$NAPCAT_PID" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$NAPCAT_PID"
+  fi
+  pkill -TERM -f "xvfb-run -a $qq_bin" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -f "xvfb-run -a $qq_bin" 2>/dev/null || true
+  # 只清理挂着我们 NapCat 目录的 qq 进程，避免误杀用户自己的 QQ
+  pkill -TERM -f "$qq_bin --no-sandbox" 2>/dev/null || true
   sleep 2
-  start_napcat
+  start_napcat_native
 }
 
 reset_admin(){
-  need python3; mkdir -p "$FARM_DATA"
+  need node; mkdir -p "$FARM_DATA"
   local password="QqFarm!$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 12)"
-  python3 - "$FARM_ADMIN" "$password" <<'PY'
-import hashlib, json, os, secrets, sys
-path, password=sys.argv[1:]
-salt=secrets.token_hex(32)
-digest=hashlib.pbkdf2_hmac('sha512', password.encode(), salt.encode(), 100000, 64).hex()
-obj={'admin':{'username':'admin','password':salt+':'+digest,'createdAt':int(__import__('time').time()*1000),'mustChangePassword':False}}
-tmp=path+'.tmp'
-with open(tmp,'w') as f: json.dump(obj,f,indent=2); f.write('\n')
-os.replace(tmp,path)
-PY
+  node -e '
+const crypto = require("crypto");
+const fs = require("fs");
+const [path, password] = process.argv.slice(1);
+const salt = crypto.randomBytes(32).toString("hex");
+const digest = crypto.pbkdf2Sync(password, salt, 100000, 64, "sha512").toString("hex");
+const obj = {
+  admin: {
+    username: "admin",
+    password: salt + ":" + digest,
+    createdAt: Date.now(),
+    mustChangePassword: false,
+  },
+};
+fs.mkdirSync(require("path").dirname(path), { recursive: true });
+fs.writeFileSync(path + ".tmp", JSON.stringify(obj, null, 2) + "\n");
+fs.renameSync(path + ".tmp", path);
+' "$FARM_ADMIN" "$password"
   printf '\n管理员账号：admin\n管理员密码：%s\n\n' "$password"
 }
+
+# ---------------------------------------------------------------- 菜单
 
 menu(){
   while true; do
     printf '\n==== QQ Farm Bot + NapCat ====\n'
-    printf '1. 源码后台启动\n2. Docker 启动\n3. 源码启动并自动安装/配置 NapCat 与 qq-miniapp-auth\n4. Docker 启动并自动安装/配置 NapCat 与 qq-miniapp-auth\n5. 重启 NapCat\n6. 重置管理员密码\n0. 退出\n'
+    printf '1. 源码后台启动\n'
+    printf '2. Docker 启动\n'
+    printf '3. 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth\n'
+    printf '4. Docker 启动并全自动安装/配置 NapCat 与 qq-miniapp-auth\n'
+    printf '5. 重启 NapCat\n'
+    printf '6. 重置管理员密码\n'
+    printf '0. 退出\n'
     read -r -p '请选择：' choice
     case "$choice" in
       1) start_source;;
       2) start_docker;;
-      3) launcher="$(install_napcat)"; install_auth_service; install_napcat_plugin; configure_napcat; configure_source; start_auth_service; start_source; start_napcat "$launcher";;
-      4) launcher="$(install_napcat)"; install_auth_service; install_napcat_plugin; configure_napcat; start_docker; configure_docker; start_auth_service; start_napcat "$launcher";;
+      3)
+        read_settings
+        install_napcat_native
+        install_auth_service
+        install_napcat_plugin
+        configure_napcat
+        configure_source
+        start_auth_service
+        start_napcat_native
+        start_source
+        ;;
+      4)
+        read_settings
+        install_napcat_docker
+        install_napcat_plugin
+        start_docker
+        configure_docker
+        configure_napcat
+        start_auth_service
+        ;;
       5) restart_napcat;;
       6) reset_admin;;
       0) exit 0;;

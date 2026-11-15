@@ -157,7 +157,7 @@ bash ./stop.sh
 
 ### 一键管理脚本（Linux，自动配置 NapCat / QQ 扫码）
 
-仓库根目录的 `qq-farm.sh` 是一个面向 Linux 的交互式管理脚本，把源码/Docker 启动与 NapCat、QQ 扫码所需的两项登录配置串成一条命令。需要 Node.js 20+、pnpm/corepack、`python3`、`curl`、`tar`、`unzip`（Docker 相关选项还需要 Docker Compose 与运行中的 Docker）。
+仓库根目录的 `qq-farm.sh` 是一个面向 Linux 的交互式管理脚本，把源码/Docker 启动与 NapCat、QQ 扫码所需的两项登录配置串成一条命令。需要 Node.js 20+、pnpm/corepack、`curl`、`tar`、`unzip`（Docker 相关选项还需要 Docker Compose 与运行中的 Docker）。所有 JSON 配置改写都由 Node 完成，因此不需要 `python3`。
 
 ```bash
 chmod +x ./qq-farm.sh
@@ -170,18 +170,33 @@ chmod +x ./qq-farm.sh
 | --- | --- |
 | `1` | 源码后台启动（`pnpm` 构建 Web/Core 后后台运行 `node core/client.js`） |
 | `2` | Docker Compose 启动 |
-| `3` | 源码启动并自动安装/配置 NapCat 与 qq-miniapp-auth |
-| `4` | Docker 启动并自动安装/配置 NapCat 与 qq-miniapp-auth |
+| `3` | 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**原生安装，不使用 Docker**） |
+| `4` | Docker 启动并全自动安装/配置 NapCat 与 qq-miniapp-auth |
 | `5` | 重启 NapCat |
 | `6` | 重置管理员密码并打印账号/随机密码 |
 | `0` | 退出 |
 
-选项 `3` / `4` 会依次完成：通过 NapCat-Installer 安装 NapCat、拉取并启动上游 [qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth)、安装 `qq-miniapp-openauth` 插件（写入 `config/plugins.json` 与 `napcat.mjs` 白名单）、把 OneBot HTTP 服务配到 `127.0.0.1:3000`，最后把「NapCat 接口地址」（`napCatEndpoint`，默认 `http://127.0.0.1:8787`）和「接口签名」（`napCatSignature`，即 `API_SIGNING_SECRET`）写入 `core/data/store.json`（Docker 模式通过 `docker cp` 写入容器并重启），省去在「设置 → 系统设置 → 登录设置」里手动填写。首次使用 QQ 扫码登录请优先选 `3` 或 `4`。
+**NapCat 版本固定跟随上游 [BUGDey/qq-farm-bot](https://github.com/BUGDey/qq-farm-bot) 的 `v4.18.19`**，可用 `NAPCAT_VERSION` 覆盖。由于 NapNeko 官方发布源已不可用，脚本改从仍在维护的镜像仓库 `XingYunStar/NapCatQQ` 下载，并按 `ghfast.top` → `gh-proxy.com` → `ghproxy.net` → 直连的顺序逐个尝试，全部失败才会报错；也可用 `NAPCAT_ZIP_URL` 直接指定一个可用的 `NapCat.Shell.zip` 地址。脚本只下载 **NapCat Shell 包**，不会去猜或强制更换原版 QQ 客户端版本。
 
-脚本会把它生成的目录放在脚本所在目录：`napcat/`（NapCat 安装、配置、数据）、`qq-miniapp-auth/`（授权服务源码）。配置持久化在 `napcat/manager-config.env`（`API_ENDPOINT`、`API_SECRET`、`ONEBOT_PORT`、`ONEBOT_TOKEN`、`NAPCAT_ROOT`）。源码后台日志写入 `app_linux.log` / `app_linux.error.log`，进程号记录在 `app_linux.pid`。Docker 模式让授权服务经 `host.docker.internal:3000` 访问 NapCat，可用 `export NAPCAT_HOST_IP=<局域网 IP>` 覆盖。
+选项 `3`（源码 + 原生 NapCat）流程：
+
+1. 下载并校验 `NapCat.Shell.zip`（`unzip -t`），解压到 `napcat/shell/`；
+2. 安装 LinuxQQ 客户端（已有 `/opt/QQ/qq` 则跳过），安装包地址从官方 `pcConfig.json` 实时解析，可用 `LINUXQQ_DEB_URL` 覆盖；
+3. 把 NapCat 复制到 `/opt/QQ/resources/app/app_launcher/napcat`，写入 `loadNapCat.js`，并把 `/opt/QQ/resources/app/package.json` 的 `main` 指向它；
+4. 用 NapCat 包内 `qqnt.json` 的 `linuxVersion` / `linuxVerHash` 对齐 `~/.config/QQ/versions/config.json`，避免客户端版本与 NapCat 期望版本不一致导致挂载失败；
+5. 拉取上游 [qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth)、安装 `qq-miniapp-openauth` 插件（写入 `config/plugins.json` 并在 `napcat.mjs` 白名单中登记，改动前自动备份 `napcat.mjs.bak.<时间戳>`）；
+6. 把 OneBot HTTP 服务配到 `127.0.0.1:3000`；
+7. 把「NapCat 接口地址」（`napCatEndpoint`，默认 `http://127.0.0.1:8787`）和「接口签名」（`napCatSignature`，即 `API_SIGNING_SECRET`）写入 `core/data/store.json`，省去在「设置 → 系统设置 → 登录设置」里手动填写；
+8. 后台启动 NapCat（`xvfb-run`）与 qq-miniapp-auth，最后启动农场源码。
+
+选项 `4`（Docker NapCat）流程与 `3` 相同，但 NapCat 运行在容器里：脚本生成 `napcat/docker/` 构建上下文（`Dockerfile` + `entrypoint.sh`），基础镜像默认 `mlikiowa/napcat-docker:v4.18.19`。镜像先尝试 `docker pull`（超时 60 秒即放弃），失败则自动下载官方同版本离线 tar 包并用 `docker load` 导入，避免 Docker Hub 不可达时卡死。容器内 OneBot 绑定 `0.0.0.0` 并通过端口映射暴露，农场容器经 `host.docker.internal:3000` 访问，可用 `export NAPCAT_HOST_IP=<局域网 IP>` 覆盖。
+
+所有配置全自动完成，不再交互询问签名或地址：`API_ENDPOINT`、`API_SECRET`、`ONEBOT_PORT` 都有默认值，可用同名环境变量覆盖；`ONEBOT_TOKEN` 首次运行时自动随机生成。
+
+脚本会把生成的目录放在脚本所在目录：`napcat/`（NapCat 安装包、配置、数据、日志）、`qq-miniapp-auth/`（授权服务源码）。配置持久化在 `napcat/manager-config.env`（`API_ENDPOINT`、`API_SECRET`、`ONEBOT_PORT`、`ONEBOT_TOKEN`、`NAPCAT_ROOT`、`NAPCAT_MODE`）。源码后台日志写入 `app_linux.log` / `app_linux.error.log`，进程号记录在 `app_linux.pid`；NapCat 日志与进程号分别是 `napcat/napcat.log` 和 `napcat/napcat.pid`。两个生成目录已加入 `.gitignore`，不会污染仓库。
 
 > [!NOTE]
-> 该脚本尚未在真实 Linux 机器上做过一次完整的 QQ 扫码验证；菜单 `3` / `4` 完成后仍需按 NapCat 提示完成一次真实扫码。
+> 该脚本尚未在真实 Linux 机器上做过一次完整的 QQ 扫码验证。菜单 `3` / `4` 完成后，请打开 `http://127.0.0.1:6099/webui/` 完成一次真实扫码；扫码后「登录设置」里的两项配置已就绪，可直接在农场面板使用 QQ 扫码登录。
 
 ### Docker Compose
 
