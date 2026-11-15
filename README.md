@@ -183,7 +183,13 @@ chmod +x ./qq-farm.sh
 - **Shell 安装**用社区留档的 [naxida2333/NapCat-Installer](https://github.com/naxida2333/NapCat-Installer)（备用 [jizizr](https://github.com/jizizr/NapCat-Installer)），以 `--docker n --cli n --proxy N --force` 非交互执行，rootless 装到 `~/Napcat`。执行前脚本会做三件事：① 用 `sed` 把 installer 里写死的失效地址改成归档仓库 `XingYunStar/NapCatQQ` 的固定 tag；② 预先下好 `NapCat.Shell.zip`；③ 预先下好 LinuxQQ 安装包并命名为 `QQ.deb`/`QQ.rpm`——installer 检测到同名文件就直接用本地包，从而绕开已失效的 `qqdl.gtimg.cn`。
 - **Docker 安装**直接拉 `mlikiowa/napcat-docker`，拉不动时依次换 `docker.1ms.run`、`docker.xuanyuan.me`、`docker.mybacc.com`、`dytt.online`、`lispy.org`、`docker.m.daocloud.io`、华为云等加速前缀，全部失败才用归档的离线 tar 包 `docker load` 导入并 `docker tag`。
 
-所有 GitHub 下载都走 10 个加速前缀的 fallback 链（`ghfast.top`、`git.yylx.win`、`gh-proxy.com`、`ghfile.geekertao.top`、`gh-proxy.net`、`j.1win.ggff.net`、`ghm.078465.xyz`、`gitproxy.127731.xyz`、`jiashu.1win.eu.org`、`github.tbedu.top`，最后直连），可用 `GH_PROXY_INDEX` 指定优先使用的加速站点。
+所有 GitHub 下载（NapCat 安装器、`NapCat.Shell.zip`、QQ 包、qq-miniapp-auth 源码、离线镜像 tar）都会走 10 个加速前缀的 fallback 链（`ghfast.top`、`git.yylx.win`、`gh-proxy.com`、`ghfile.geekertao.top`、`gh-proxy.net`、`j.1win.ggff.net`、`ghm.078465.xyz`、`gitproxy.127731.xyz`、`jiashu.1win.eu.org`、`github.tbedu.top`，最后直连），每个地址内部再重试 3 次；可用 `GH_PROXY_INDEX` 指定优先使用的加速站点。下载过程只打印一行 `[INFO] 下载：<地址>`（curl 用 `-sS`，不输出进度条），只有失败时才会看到 curl 的错误行。
+
+另外三类下载各有一套补充源：
+
+- `api.github.com` 不能套全部加速前缀（多数站点只代理 `github.com`），单独用实测可用的 4 个：`gh-proxy.com`、`gh-proxy.net`、`jiashu.1win.eu.org`、`git.yylx.win`；
+- qq-miniapp-auth 源码有两条出口（`github.com/<repo>/archive/refs/heads/master.tar.gz` 与 `codeload.github.com/<repo>/tar.gz/refs/heads/master`），因为加速站只认前一种形式；NapCat 安装器还额外有一条 jsDelivr 兜底（`cdn.jsdelivr.net/gh/naxida2333/NapCat-Installer@main/script/install.sh`）；
+- npm / pnpm 依赖按 `registry.npmmirror.com` → `registry.npmjs.org` → `mirrors.cloud.tencent.com/npm` 依次尝试，`corepack` 下载 pnpm 本体也指向第一个源。
 
 关于 QQ 客户端：**NapCat 不是独立程序，而是注入 QQ 客户端进程的插件**，自身不带 `wrapper.node`，必须由 QQ 主进程加载才能拿到 NTQQ 原生接口，所以只装 `NapCat.Shell.zip` 跑不起来——installer 会用 `dpkg -x` / `rpm2cpio` 把 QQ 解包到 `~/Napcat/opt/QQ`，全程不需要 root 也不需要系统包管理器安装。QQ 安装包默认从 [zydou/QQ-Linux](https://github.com/zydou/QQ-Linux) 的 release 取（先查 API 取最新，失败回退已知 tag），可用 `QQ_PKG_URL` 指定；两者的下载包都缓存在 `napcat/` 下，重装不会重复下载。
 

@@ -31,9 +31,10 @@ else
 fi
 NAPCAT_DIR="$ROOT_DIR/napcat"
 AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
-AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-https://codeload.github.com/liyangpengs/qq-miniapp-auth/tar.gz/refs/heads/master}"
+# 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
+AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-16.4"
+SCRIPT_VERSION="2026-11-16.5"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -49,6 +50,8 @@ NAPCAT_VERSION="${NAPCAT_VERSION:-v4.18.19}"
 NAPCAT_ARCHIVE_REPO="${NAPCAT_ARCHIVE_REPO:-XingYunStar/NapCatQQ}"
 NAPCAT_INSTALLER_URL="${NAPCAT_INSTALLER_URL:-https://raw.githubusercontent.com/naxida2333/NapCat-Installer/main/script/install.sh}"
 NAPCAT_INSTALLER_URL_BACKUP="${NAPCAT_INSTALLER_URL_BACKUP:-https://raw.githubusercontent.com/jizizr/NapCat-Installer/main/script/install.sh}"
+# raw.githubusercontent.com 连加速站一起挂了时的最后一条：jsDelivr 的 gh 通道（不经 GitHub 源站）
+NAPCAT_INSTALLER_URL_FALLBACK="${NAPCAT_INSTALLER_URL_FALLBACK:-https://cdn.jsdelivr.net/gh/naxida2333/NapCat-Installer@main/script/install.sh}"
 NAPCAT_IMAGE_BASE="${NAPCAT_IMAGE_BASE:-mlikiowa/napcat-docker}"
 NAPCAT_IMAGE_TAG="${NAPCAT_IMAGE_TAG:-v4.18.19}"
 NAPCAT_IMAGE="${NAPCAT_IMAGE:-$NAPCAT_IMAGE_BASE:$NAPCAT_IMAGE_TAG}"
@@ -164,27 +167,81 @@ gh_url_variants(){
 
 fetch_to(){
   local dest="$1"; shift
-  local url
+  local url attempt
   for url in "$@"; do
     [[ -n "$url" ]] || continue
     info "下载：$url"
-    if curl -fL --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 3600 \
-        -A 'Mozilla/5.0' -o "$dest.part" "$url"; then
-      mv "$dest.part" "$dest"
-      return 0
-    fi
+    # -sS：不要 curl 的进度条（那堆 % Total / % Received 只会刷屏），出错仍打印原因
+    # 每个候选地址内部再重试 2 次，避免加速站点偶发 5xx/掐断直接判死
+    for attempt in 1 2 3; do
+      if curl -fsSL -S --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 3600 \
+          -A 'Mozilla/5.0' -o "$dest.part" "$url"; then
+        mv "$dest.part" "$dest"
+        return 0
+      fi
+      [[ "$attempt" -lt 3 ]] && sleep 2
+    done
+    rm -f "$dest.part"
     warn "该地址下载失败，尝试下一个"
   done
   rm -f "$dest.part"
   return 1
 }
 
-# 从 GitHub 下载（自动套用加速前缀）
+# 从 GitHub 下载（自动套用加速前缀）。可一次传多个原始地址，按序展开后逐个尝试
 fetch_github(){
-  local dest="$1" url="$2"
-  local -a urls=()
-  mapfile -t urls < <(gh_url_variants "$url")
+  local dest="$1"; shift
+  local base
+  local -a urls=() variants=()
+  for base in "$@"; do
+    [[ -n "$base" ]] || continue
+    mapfile -t variants < <(gh_url_variants "$base")
+    urls+=("${variants[@]}")
+  done
   fetch_to "$dest" "${urls[@]}"
+}
+
+# GitHub API 不能走全部加速站点（多数只代理 github.com），这里单独给一份实测可用的前缀，
+# 仍然先试 GH_PROXY_INDEX 指定的那个，最后直连 api.github.com。
+GH_API_PROXY_PREFIXES=(
+  "https://gh-proxy.com/"
+  "https://gh-proxy.net/"
+  "https://jiashu.1win.eu.org/"
+  "https://git.yylx.win/"
+)
+
+api_url_variants(){
+  local url="$1"
+  local -a out=()
+  local i
+  if [[ -n "${GH_PROXY_INDEX:-}" && "${GH_PROXY_INDEX:-}" =~ ^[0-9]+$ ]]; then
+    if ((GH_PROXY_INDEX >= 1 && GH_PROXY_INDEX <= ${#GH_API_PROXY_PREFIXES[@]})); then
+      out+=("${GH_API_PROXY_PREFIXES[$((GH_PROXY_INDEX - 1))]}${url}")
+    fi
+  fi
+  for i in "${!GH_API_PROXY_PREFIXES[@]}"; do
+    [[ -n "${GH_PROXY_INDEX:-}" ]] && ((i + 1 == GH_PROXY_INDEX)) && continue
+    out+=("${GH_API_PROXY_PREFIXES[$i]}${url}")
+  done
+  out+=("$url")
+  printf '%s\n' "${out[@]}"
+}
+
+# qq-miniapp-auth 源码包的两个 GitHub 出口，各自再套一遍加速前缀：
+#   codeload.github.com/...tar.gz   —— 直连可用的老地址
+#   github.com/.../archive/...tar.gz —— ghfast 等站点真正支持的那条
+AUTH_REPO="${AUTH_REPO:-liyangpengs/qq-miniapp-auth}"
+AUTH_BRANCH="${AUTH_BRANCH:-master}"
+
+auth_tarball_urls(){
+  local -a fam=()
+  if [[ -n "${AUTH_TARBALL_URL:-}" ]]; then printf '%s\n' "$AUTH_TARBALL_URL"; fi
+  # 加速站只认 github.com 的 /archive/ 形式，直接把 codeload 域名套前缀会 403/14 字节，
+  # 所以先出「前缀 + github.com/archive」，最后再补一条 codeload 直连。
+  mapfile -t fam < <(gh_url_variants \
+    "https://github.com/${AUTH_REPO}/archive/refs/heads/${AUTH_BRANCH}.tar.gz")
+  printf '%s\n' "${fam[@]}"
+  printf '%s\n' "https://codeload.github.com/${AUTH_REPO}/tar.gz/refs/heads/${AUTH_BRANCH}"
 }
 
 # ---------------------------------------------------------------- LinuxQQ 安装包
@@ -207,8 +264,10 @@ qq_pkg_ext(){
 qq_deb_url_from_api(){
   local arch="$1" ext="$2" json
   json="$TMPDIR/qq-linux-releases.$$.json"
-  # API 只有直连可用（加速站点只代理 github.com，不代理 api.github.com）
-  fetch_to "$json" 'https://api.github.com/repos/zydou/QQ-Linux/releases?per_page=20' >/dev/null 2>&1 \
+  # api.github.com 不能走全部加速站点（多数只代理 github.com），用单独一张实测可用的表
+  local -a urls=()
+  mapfile -t urls < <(api_url_variants "https://api.github.com/repos/${QQ_PKG_REPO:-zydou/QQ-Linux}/releases?per_page=20")
+  fetch_to "$json" "${urls[@]}" >/dev/null 2>&1 \
     || { rm -f "$json"; return 1; }
   local url
   url="$(node -e '
@@ -297,18 +356,19 @@ napcat_get_installer(){
   local work="$1"
   local dest="$work/napcat.sh"
   rm -f "$dest"
-  local base p try_url
-  local -a bases=("$NAPCAT_INSTALLER_URL" "$NAPCAT_INSTALLER_URL_BACKUP")
-  local -a proxy_order=()
-  if [[ -n "${GH_PROXY_INDEX:-}" ]]; then proxy_order+=("$GH_PROXY_INDEX"); fi
-  proxy_order+=(0 1 2 3 4 5)
+  local base try_url
+  local -a bases=("$NAPCAT_INSTALLER_URL" "$NAPCAT_INSTALLER_URL_BACKUP" \
+                  "$NAPCAT_INSTALLER_URL_FALLBACK")
+  local -a urls=() variants=()
+  # 两个候选仓库 × 全部加速前缀 + 直连，逐个试；每个地址内部再重试 2 次
   for base in "${bases[@]}"; do
-    for p in "${proxy_order[@]}"; do
-      if [[ "$p" == '0' ]]; then
-        try_url="$base"
-      else
-        try_url="${GH_PROXY_PREFIXES[$((p - 1))]}${base}"
-      fi
+    [[ -n "$base" ]] || continue
+    mapfile -t variants < <(gh_url_variants "$base")
+    urls+=("${variants[@]}")
+  done
+  local attempt
+  for try_url in "${urls[@]}"; do
+    for attempt in 1 2; do
       # 不要写成 `head -n 1 | grep -q`：grep 命中即退出会让 head 收到 SIGPIPE，
       # 配合 pipefail 会把「下载成功」误判成失败。
       if curl -fsSL --connect-timeout 20 --max-time 120 -o "$dest" "$try_url" \
@@ -317,10 +377,11 @@ napcat_get_installer(){
         printf '%s\n' "$dest"
         return 0
       fi
+      [[ "$attempt" -lt 2 ]] && sleep 2
     done
+    rm -f "$dest"
   done
-  rm -f "$dest"
-  die "NapCat 安装器下载失败（已试社区留档的两个地址）：$NAPCAT_INSTALLER_URL"
+  die "NapCat 安装器下载失败（已试两个留档仓库、全部加速前缀与直连）：$NAPCAT_INSTALLER_URL"
 }
 
 # installer 内部仍写死已失效的官方地址，执行前就地改成归档地址：
@@ -577,7 +638,9 @@ install_auth_service(){
   if [[ ! -d "$AUTH_DIR" ]]; then
     info '下载 qq-miniapp-auth 源码…'
     local tmp="$TMPDIR/qq-miniapp-auth.$$.tar.gz"
-    fetch_to "$tmp" "$AUTH_TARBALL_URL" || die 'qq-miniapp-auth 源码下载失败'
+    local -a srcs=()
+    mapfile -t srcs < <(auth_tarball_urls)
+    fetch_to "$tmp" "${srcs[@]}" || die 'qq-miniapp-auth 源码下载失败（已试 codeload / archive 两条地址与全部加速前缀，可用 AUTH_TARBALL_URL 指定）'
     mkdir -p "$ROOT_DIR/.auth-extract"
     tar -xzf "$tmp" -C "$ROOT_DIR/.auth-extract"
     local extracted
@@ -622,12 +685,40 @@ fs.writeFileSync(path, s);
   if [[ -d "$AUTH_DIR/node_modules" && -f "$AUTH_DIR/node_modules/.package-lock.json" ]]; then
     ok 'qq-miniapp-auth 依赖已安装，跳过 npm install'
   else
-    pushd "$AUTH_DIR" >/dev/null
-    if [[ -f package-lock.json ]]; then npm ci --omit=dev
-    else npm install --omit=dev; fi
-    popd >/dev/null
+    npm_install_in "$AUTH_DIR"
   fi
   ok "qq-miniapp-auth 已准备：$AUTH_DIR"
+}
+
+# 依赖安装也走多源：npm 官方源被墙/超时时按序换镜像，避免整条安装链卡死
+NPM_REGISTRIES=(
+  "https://registry.npmmirror.com"
+  "https://registry.npmjs.org"
+  "https://mirrors.cloud.tencent.com/npm"
+)
+
+npm_install_in(){
+  local dir="$1"; shift
+  local -a extra=()
+  if (( $# )); then extra=("$@"); fi
+  local reg rc
+  if [[ -d "$dir/node_modules" && -f "$dir/node_modules/.package-lock.json" ]]; then
+    ok "依赖已安装，跳过：$dir"
+    return 0
+  fi
+  for reg in "${NPM_REGISTRIES[@]}"; do
+    info "安装依赖（registry=$reg）…"
+    pushd "$dir" >/dev/null
+    if [[ -f package-lock.json ]]; then
+      npm ci --omit=dev --no-audit --no-fund --registry="$reg" ${extra[@]+"${extra[@]}"} && rc=0 || rc=$?
+    else
+      npm install --omit=dev --no-audit --no-fund --registry="$reg" ${extra[@]+"${extra[@]}"} && rc=0 || rc=$?
+    fi
+    popd >/dev/null
+    if [[ "$rc" -eq 0 ]]; then return 0; fi
+    warn "该 npm 源安装失败（$reg），换下一个"
+  done
+  return 1
 }
 
 start_auth_service(){
@@ -970,9 +1061,25 @@ install_pkgs(){
 # ---------------------------------------------------------------- 农场本体
 
 run_pnpm(){
-  if command -v corepack >/dev/null 2>&1; then corepack pnpm "$@"
+  # corepack 首次会自己去下 pnpm 本体，也要走镜像，否则一样卡在 registry.npmjs.org
+  if command -v corepack >/dev/null 2>&1; then
+    COREPACK_NPM_REGISTRY="${NPM_REGISTRIES[0]}" corepack pnpm "$@"
   elif command -v pnpm >/dev/null 2>&1; then pnpm "$@"
   else die '需要 pnpm 或 corepack'; fi
+}
+
+# pnpm install 也按源逐个重试，全部失败才由调用方处理
+pnpm_install_multi(){
+  local dir="$1"; shift
+  local reg
+  for reg in "${NPM_REGISTRIES[@]}"; do
+    info "安装依赖（pnpm install，registry=$reg）…"
+    if run_pnpm -C "$dir" install --frozen-lockfile --registry="$reg" "$@"; then
+      return 0
+    fi
+    warn "该 npm 源安装失败（$reg），换下一个"
+  done
+  return 1
 }
 
 source_running(){
@@ -991,8 +1098,7 @@ start_source(){
     return 0
   fi
   if [[ ! -d "$PROJECT_DIR/node_modules" ]]; then
-    info '安装依赖（pnpm install）…'
-    run_pnpm -C "$PROJECT_DIR" install --frozen-lockfile
+    pnpm_install_multi "$PROJECT_DIR" || die '依赖安装失败：已试 npmmirror / npmjs / 腾讯云 三个源'
   fi
   if [[ ! -f "$PROJECT_DIR/web/dist/index.html" ]]; then
     info '构建前端（pnpm -C web run build）…'
