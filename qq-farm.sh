@@ -28,7 +28,7 @@ NAPCAT_DIR="$ROOT_DIR/napcat"
 AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-https://codeload.github.com/liyangpengs/qq-miniapp-auth/tar.gz/refs/heads/master}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-16.2"
+SCRIPT_VERSION="2026-11-16.3"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -152,6 +152,48 @@ pc_config_urls(){
     "https://im.qq.com/proxy/domain/qq-web.cdn-go.cn/im.qq.com_new/latest/rainbow/pcConfig.json"
 }
 
+# 把 napcat-docker 的 OCI tar 当作普通归档来解：
+# 该包里 opt/QQ 是完整 QQ 客户端（含 wrapper.node），app/NapCat.Shell.zip 是配套插件体。
+# 全部用 tar 完成，不依赖 docker 守护进程，也不需要访问外网。
+#
+# 做法：按 manifest.json 的 Layers 顺序逐层解开（docker save 的层未压缩，直接就是 tar），
+# 只解 want 里点名的路径，避免把整层 Ubuntu 根文件系统铺到磁盘上；后层覆盖前层。
+oci_extract_paths(){
+  local tarfile="$1" dest="$2"; shift 2
+  local -a want=("$@")
+  local -a layers=()
+  local member blob list
+  need tar; need node
+  ((${#want[@]})) || die 'oci_extract_paths 没有指定要抽取的路径'
+  mapfile -t layers < <(tar -xOf "$tarfile" manifest.json 2>/dev/null | node -e '
+let s = "";
+process.stdin.on("data", d => s += d).on("end", () => {
+  let m;
+  try { m = JSON.parse(s); } catch (e) { process.exit(1); }
+  const layers = (Array.isArray(m) ? m[0] : m).Layers || [];
+  for (const l of layers) process.stdout.write(l + "\n");
+});' 2>/dev/null || true)
+  ((${#layers[@]})) || die "无法解析离线镜像包 manifest.json：$tarfile"
+  mkdir -p "$dest"
+  for member in "${layers[@]}"; do
+    blob="$dest/.layer.tar"
+    tar -xOf "$tarfile" "$member" > "$blob" 2>/dev/null || { rm -f "$blob"; continue; }
+    list="$(tar -tf "$blob" 2>/dev/null || true)"
+    if [[ -z "$list" ]]; then rm -f "$blob"; continue; fi
+    local hit=0 w
+    for w in "${want[@]}"; do
+      case "$list" in *"$w"*) hit=1; break;; esac
+    done
+    if ((hit)); then
+      info "从离线镜像包解出：${want[*]}"
+      tar -xf "$blob" -C "$dest" --wildcards "${want[@]}" 2>/dev/null \
+        || tar -xf "$blob" -C "$dest" "${want[@]}" 2>/dev/null || true
+    fi
+    rm -f "$blob"
+  done
+  return 0
+}
+
 # ---------------------------------------------------------------- 源码 / Docker
 
 run_pnpm(){
@@ -212,9 +254,20 @@ start_docker(){
 }
 
 # ---------------------------------------------------------------- LinuxQQ 客户端
+#
+# 关于「为什么还要 QQ」：
+#   NapCat 不是独立程序，它是注入 QQ 客户端进程的插件。它自身不带 wrapper.node，
+#   必须由 QQ 主进程 import 进来才能拿到 NTQQ 原生接口。所以只有 NapCat.Shell.zip
+#   是跑不起来的（实测直接 node napcat.mjs 会卡在管道/worker 上反复退出）。
+#
+# 关于「为什么不再去下 deb」：
+#   qqdl.gtimg.cn 已经对 deb 返回 403，dldir1 全 404，没有可用的裸 deb 镜像。
+#   但官方 napcat-docker 镜像本身就装了 QQ + wrapper.node + 配套的 NapCat.Shell.zip，
+#   所以我们直接从那个 OCI 包里把 /opt/QQ 和 Shell 包解出来用——不需要 Docker 守护进程，
+#   也不需要访问腾讯的下载服务器。QQ 与 NapCat 的版本还是镜像作者配好的一对。
 
-# 从官方 pcConfig.json 解析当前 LinuxQQ 下载地址；也可用 LINUXQQ_DEB_URL 直接指定
 resolve_linuxqq_url(){
+  # 保留给需要指定 deb 的场景；正常流程不使用（qqdl 已 403）
   local fmt="$1"
   if [[ -n "${LINUXQQ_DEB_URL:-}" ]]; then
     printf '%s\n' "$LINUXQQ_DEB_URL"
@@ -257,39 +310,110 @@ install_pkgs(){
   fi
 }
 
+# QQ 客户端运行所需（不装 QQ 本体，只装它依赖的系统库）
+install_qq_runtime_deps(){
+  info '检查 QQ 运行依赖（缺什么装什么）…'
+  local -a need_pkgs=()
+  local lib
+  # 只补缺失的库，避免每次全量 apt 一遍
+  local -A lib_pkg=(
+    [libnss3.so]=libnss3
+    [libgbm.so.1]=libgbm1
+    [libasound.so.2]=libasound2
+    [libgtk-3.so.0]=libgtk-3-0
+    [libatspi.so.0]=libatspi2.0-0
+    [libXss.so.1]=libxss1
+    [libXtst.so.6]=libxtst6
+    [libsecret-1.so.0]=libsecret-1-0
+    [libnotify.so.4]=libnotify4
+    [libnssutil3.so]=libnss3
+  )
+  # 一次性取回库清单，避免 ldconfig 与 grep -q 组管道时被 SIGPIPE 干扰
+  local libs
+  libs="$(ldconfig -p 2>/dev/null || true)"
+  for lib in "${!lib_pkg[@]}"; do
+    [[ "$libs" == *"$lib"* ]] || need_pkgs+=("${lib_pkg[$lib]}")
+  done
+  need_pkgs+=(libdbus-1-3 libgtk-3-0 fonts-wqy-zenhei xvfb unzip)
+  # 去重
+  local -a uniq=()
+  local p
+  for p in "${need_pkgs[@]}"; do
+    [[ " ${uniq[*]} " == *" $p "* ]] || uniq+=("$p")
+  done
+  install_pkgs "${uniq[@]}" >/dev/null 2>&1 || warn '部分依赖安装失败，继续尝试'
+  # Ubuntu 24.04 把 libasound2 改名成了 libasound2t64
+  install_pkgs libasound2 >/dev/null 2>&1 || install_pkgs libasound2t64 >/dev/null 2>&1 || true
+}
+
 install_qq_client(){
   if [[ -x /opt/QQ/qq ]]; then
     ok '已检测到 LinuxQQ：/opt/QQ/qq'
+    install_qq_runtime_deps
     return 0
   fi
   require_root_ability
-  local fmt='deb'
-  if ! command -v dpkg >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then fmt='rpm'; fi
-  local url
-  url="$(resolve_linuxqq_url "$fmt" || true)"
-  if [[ -z "$url" ]]; then
-    die '无法获取 LinuxQQ 下载地址。可执行前设置 LINUXQQ_DEB_URL=<deb 直链> 后重试'
-  fi
-  info "LinuxQQ 安装包：$url"
-  local pkg="$TMPDIR/linuxqq.$$.$fmt"
-  fetch_to "$pkg" "$url" || die "LinuxQQ 下载失败：$url"
-  info '安装 LinuxQQ 运行依赖…'
-  install_pkgs curl unzip xvfb libnss3 libgbm1 >/dev/null 2>&1 || warn '部分依赖安装失败，继续尝试'
-  install_pkgs libasound2 >/dev/null 2>&1 || install_pkgs libasound2t64 >/dev/null 2>&1 || true
-  if [[ "$fmt" == 'deb' ]]; then
-    if ! as_root apt-get install -y "$pkg" >/dev/null 2>&1; then
-      as_root dpkg -i --force-depends "$pkg" || true
-      as_root apt-get install -f -y >/dev/null 2>&1 || true
+  # 只在用户显式给了 deb 时才走 deb 安装（qqdl 已 403，正常流程不会走到这）
+  if [[ -n "${LINUXQQ_DEB_URL:-}" ]]; then
+    local fmt='deb'
+    if ! command -v dpkg >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then fmt='rpm'; fi
+    info "LinuxQQ 安装包：$LINUXQQ_DEB_URL"
+    local pkg="$TMPDIR/linuxqq.$$.$fmt"
+    fetch_to "$pkg" "$LINUXQQ_DEB_URL" || die "LinuxQQ 下载失败：$LINUXQQ_DEB_URL"
+    install_qq_runtime_deps
+    if [[ "$fmt" == 'deb' ]]; then
+      if ! as_root apt-get install -y "$pkg" >/dev/null 2>&1; then
+        as_root dpkg -i --force-depends "$pkg" || true
+        as_root apt-get install -f -y >/dev/null 2>&1 || true
+      fi
+    else
+      as_root rpm -Uvh --replacepkgs "$pkg" || as_root dnf install -y "$pkg" || true
     fi
-  else
-    as_root rpm -Uvh --replacepkgs "$pkg" || as_root dnf install -y "$pkg" || true
+    rm -f "$pkg"
+    [[ -x /opt/QQ/qq ]] || die 'LinuxQQ 安装后未找到 /opt/QQ/qq'
+    ok 'LinuxQQ 安装完成'
+    return 0
   fi
-  rm -f "$pkg"
-  [[ -x /opt/QQ/qq ]] || die 'LinuxQQ 安装后未找到 /opt/QQ/qq，请手动安装后重试'
-  ok 'LinuxQQ 安装完成'
+  # 默认：从 napcat-docker 离线镜像包里取 QQ 客户端（内含 wrapper.node，与 NapCat 版本配套）
+  info '从 NapCat 官方离线镜像包中提取 QQ 客户端（不再访问腾讯下载服务器）'
+  local tarfile
+  tarfile="$(napcat_image_tar)"
+  local stage="$NAPCAT_DIR/qq-stage"
+  rm -rf "$stage"; mkdir -p "$stage"
+  oci_extract_paths "$tarfile" "$stage" 'opt/QQ' 'opt/QQ/*'
+  [[ -x "$stage/opt/QQ/qq" ]] || die "离线镜像包中未找到 opt/QQ/qq：$tarfile"
+  [[ -s "$stage/opt/QQ/resources/app/wrapper.node" ]] \
+    || die "离线镜像包中的 QQ 缺少 wrapper.node（NapCat 无法注入）：$tarfile"
+  info '安装系统依赖…'
+  install_qq_runtime_deps
+  info '安装 QQ 客户端到 /opt/QQ…'
+  as_root rm -rf /opt/QQ
+  as_root mkdir -p /opt
+  as_root cp -a "$stage/opt/QQ" /opt/QQ
+  as_root chmod 4755 /opt/QQ/chrome-sandbox 2>/dev/null || true
+  as_root chmod +x /opt/QQ/qq 2>/dev/null || true
+  rm -rf "$stage"
+  [[ -x /opt/QQ/qq ]] || die '安装 QQ 后未找到 /opt/QQ/qq'
+  local v=''
+  v="$(node -e 'try{process.stdout.write(require("/opt/QQ/resources/app/package.json").version||"")}catch(e){}' 2>/dev/null || true)"
+  ok "QQ 客户端已就绪：/opt/QQ/qq${v:+（版本 $v）}"
 }
 
 # ---------------------------------------------------------------- NapCat 安装
+
+napcat_arch_tag(){
+  case "$(uname -m)" in
+    x86_64|amd64) printf '%s\n' 'amd64' ;;
+    aarch64|arm64) printf '%s\n' 'arm64' ;;
+    *) return 1 ;;
+  esac
+}
+
+napcat_image_tar_path(){
+  local arch_tar
+  arch_tar="$(napcat_arch_tag)" || return 1
+  printf '%s\n' "$NAPCAT_DIR/napcat-docker-${NAPCAT_VERSION}-${arch_tar}.tar"
+}
 
 napcat_zip(){
   local zip="$NAPCAT_DIR/NapCat.Shell.zip"
@@ -299,7 +423,27 @@ napcat_zip(){
     printf '%s\n' "$zip"
     return 0
   fi
-  need curl; need unzip
+  need unzip
+  # 优先用离线镜像包里那一份：它与同包内的 QQ 是作者配好的一对，避免版本对不上
+  local tarfile=''
+  tarfile="$(napcat_image_tar_path 2>/dev/null || true)"
+  if [[ -n "$tarfile" && -s "$tarfile" ]]; then
+    info '从离线镜像包中取出配套的 NapCat.Shell.zip…'
+    local stage="$NAPCAT_DIR/zip-stage"
+    rm -rf "$stage"; mkdir -p "$stage"
+    oci_extract_paths "$tarfile" "$stage" 'app/NapCat.Shell.zip'
+    if [[ -s "$stage/app/NapCat.Shell.zip" ]]; then
+      mv "$stage/app/NapCat.Shell.zip" "$zip"
+      rm -rf "$stage"
+      unzip -tq "$zip" >/dev/null 2>&1 || die '离线镜像包内的 NapCat.Shell.zip 校验失败'
+      ok "已使用镜像内配套的 NapCat Shell 包（$NAPCAT_VERSION）"
+      printf '%s\n' "$zip"
+      return 0
+    fi
+    rm -rf "$stage"
+    warn '离线镜像包内未找到 NapCat.Shell.zip，改为单独下载'
+  fi
+  need curl
   local urls=()
   mapfile -t urls < <(napcat_zip_urls)
   rm -f "$zip"
@@ -322,61 +466,20 @@ fs.renameSync(p + ".tmp", p);
 ' "$pkg_json"
 }
 
-# NapCat Shell 包内 qqnt.json 声明了它期望的 LinuxQQ 版本；
-# 官方客户端版本更新后，必须把 QQ 的 versions/config.json 对齐，否则 NapCat 无法挂载。
-patch_qq_version_config(){
-  local extract="$1"
-  need node
-  local qqnt="$extract/qqnt.json"
-  [[ -f "$qqnt" ]] || { warn 'NapCat 包内没有 qqnt.json，跳过版本对齐'; return 0; }
-  local target_ver target_hash
-  target_ver="$(node -e 'const j=require(process.argv[1]); process.stdout.write(j.linuxVersion||j.version||"")' "$qqnt" 2>/dev/null || true)"
-  target_hash="$(node -e 'const j=require(process.argv[1]); process.stdout.write(j.linuxVerHash||j.verHash||"")' "$qqnt" 2>/dev/null || true)"
-  if [[ -z "$target_ver" ]]; then
-    warn '无法解析 qqnt.json 中的 LinuxQQ 版本，跳过版本对齐'
-    return 0
-  fi
-  local build="${target_ver##*-}"
-  info "NapCat 期望的 LinuxQQ 版本：$target_ver（build $build）"
-  local node_bin; node_bin="$(command -v node)"
-  local confs=()
-  local home_dir
-  for home_dir in /root "/home/$(id -un)" "${HOME:-}"; do
-    [[ -n "$home_dir" && -f "$home_dir/.config/QQ/versions/config.json" ]] \
-      && confs+=("$home_dir/.config/QQ/versions/config.json")
-  done
-  if ((${#confs[@]} == 0)); then
-    # 还没登录过 QQ，先建好初始配置，避免挂载失败
-    local cfg_dir="${HOME:-/root}/.config/QQ/versions"
-    as_root mkdir -p "$cfg_dir"
-    echo '{}' | as_root tee "$cfg_dir/config.json" >/dev/null
-    confs=("$cfg_dir/config.json")
-  fi
-  local conf
-  for conf in "${confs[@]}"; do
-    as_root "$node_bin" -e '
-const fs = require("fs");
-const [path, ver, build, hashArg] = process.argv.slice(1);
-let obj = {};
-try { obj = JSON.parse(fs.readFileSync(path, "utf8")); } catch (e) { obj = {}; }
-obj.baseVersion = ver;
-obj.curVersion = ver;
-obj.buildId = build;
-if (hashArg) obj.hash = hashArg;
-fs.writeFileSync(path + ".tmp", JSON.stringify(obj, null, 2) + "\n");
-fs.renameSync(path + ".tmp", path);
-' "$conf" "$target_ver" "$build" "$target_hash"
-    ok "已对齐 QQ 版本配置：$conf"
-  done
-}
-
+# NapCat Shell 包内 qqnt.json 声明了它期望的 LinuxQQ 版本，但官方镜像里的 QQ
+# 与它并不一致，镜像本身也没做这个对齐，照样能跑。这里不再强行改写
+# ~/.config/QQ/versions/config.json，避免把用户已有的 QQ 配置改坏。
 install_napcat_native(){
-  need curl; need unzip; need node
+  need tar; need unzip; need node
   require_root_ability
+  # 先把离线镜像包准备好：QQ 客户端和 NapCat 插件体都从这一份里取，
+  # 保证两者版本配套，也不需要访问腾讯的 deb 服务器。
+  local tarfile
+  tarfile="$(napcat_image_tar)"
   local zip; zip="$(napcat_zip)"
   install_qq_client
   local app_dir="$QQ_APP_DIR"
-  [[ -d "$app_dir" ]] || die "未找到 LinuxQQ 安装目录：$app_dir"
+  [[ -d "$app_dir" ]] || die "未找到 QQ 安装目录：$app_dir"
   local target="$app_dir/app_launcher/napcat"
   local extract="$NAPCAT_DIR/shell"
   rm -rf "$extract"; mkdir -p "$extract"
@@ -385,10 +488,13 @@ install_napcat_native(){
   as_root mkdir -p "$target"
   as_root cp -rf "$extract/." "$target/"
   as_root chmod -R 755 "$target"
+  # 该 loadNapCat.js 会被 QQ 主进程加载，路径必须是宿主机的绝对路径
   printf "(async () => {await import('file://%s/napcat.mjs');})();\n" "$target" \
     | as_root tee "$app_dir/loadNapCat.js" >/dev/null
   patch_qq_main "$app_dir/package.json"
-  patch_qq_version_config "$extract"
+  # 注意：不修改 ~/.config/QQ/versions/config.json。
+  # 官方镜像里 QQ(3.2.30-50969) 与 Shell 包 qqnt.json 声明的版本并不相同，而且镜像
+  # 本身不做这个对齐也能正常跑；强行改写反而可能让 QQ 判定版本异常。
   NAPCAT_ROOT="$target"
   NAPCAT_MODE="native"
   save_state
@@ -475,6 +581,7 @@ napcat_image_tar_urls(){
     *) return 0 ;;
   esac
   name="napcat-docker-${NAPCAT_VERSION}-${arch}.tar"
+  [[ -n "${NAPCAT_IMAGE_TAR_URL:-}" ]] && printf '%s\n' "$NAPCAT_IMAGE_TAR_URL"
   printf '%s\n' \
     "https://ghfast.top/https://github.com/XingYunStar/NapCatQQ/releases/download/$NAPCAT_VERSION/$name" \
     "https://gh-proxy.com/https://github.com/XingYunStar/NapCatQQ/releases/download/$NAPCAT_VERSION/$name" \
@@ -483,6 +590,30 @@ napcat_image_tar_urls(){
 }
 
 # 确保基础镜像在本地：优先复用，其次 docker pull，最后用官方 release 的离线 tar 包 docker load
+# 下载（或复用）NapCat 官方离线镜像包，返回路径。选项 3 和选项 4 共用同一份缓存。
+napcat_image_tar(){
+  need curl
+  local tarfile
+  tarfile="$(napcat_image_tar_path)" \
+    || die "不支持的 CPU 架构：$(uname -m)，请手动设置 NAPCAT_IMAGE / NAPCAT_IMAGE_TAR_URL"
+  mkdir -p "$NAPCAT_DIR"
+  if [[ -s "$tarfile" ]]; then
+    ok "已有离线镜像包：$tarfile"
+    printf '%s\n' "$tarfile"
+    return 0
+  fi
+  need tar
+  local -a urls=()
+  mapfile -t urls < <(napcat_image_tar_urls)
+  ((${#urls[@]})) || die "无法确定离线镜像包地址（可设置 NAPCAT_IMAGE_TAR_URL）"
+  info "下载 NapCat 离线镜像包（约 570MB，含 QQ 客户端与 NapCat 插件体）：${tarfile##*/}"
+  fetch_to "$tarfile" "${urls[@]}" || die 'NapCat 离线镜像包下载失败（可用 NAPCAT_IMAGE_TAR_URL 指定镜像）'
+  tar -xOf "$tarfile" manifest.json >/dev/null 2>&1 \
+    || die "离线镜像包格式异常（缺 manifest.json）：$tarfile"
+  ok "离线镜像包就绪：$tarfile"
+  printf '%s\n' "$tarfile"
+}
+
 ensure_napcat_base_image(){
   if docker image inspect "$NAPCAT_IMAGE" >/dev/null 2>&1; then
     ok "已存在基础镜像：$NAPCAT_IMAGE"
@@ -500,21 +631,8 @@ ensure_napcat_base_image(){
     return 0
   fi
   warn '无法直接从镜像仓库拉取，改用官方离线包（与 BUGDey 使用的版本一致）'
-  need curl
-  local arch_tar
-  case "$(uname -m)" in
-    x86_64|amd64) arch_tar='amd64' ;;
-    aarch64|arm64) arch_tar='arm64' ;;
-    *) die "不支持的 CPU 架构：$(uname -m)，请手动设置 NAPCAT_IMAGE" ;;
-  esac
-  local urls=() tarfile
-  mapfile -t urls < <(napcat_image_tar_urls)
-  tarfile="$NAPCAT_DIR/napcat-docker-${NAPCAT_VERSION}-${arch_tar}.tar"
-  if [[ ! -s "$tarfile" ]]; then
-    fetch_to "$tarfile" "${urls[@]}" || die 'NapCat 离线镜像包下载失败（可用 NAPCAT_IMAGE 指定自建镜像）'
-  else
-    ok "已有离线镜像包：$tarfile"
-  fi
+  local tarfile
+  tarfile="$(napcat_image_tar)"
   info '导入离线镜像（文件较大，请耐心等待）…'
   local load_out
   load_out="$(docker load -i "$tarfile" 2>&1)" || die "docker load 失败：$tarfile"

@@ -176,20 +176,21 @@ chmod +x ./qq-farm.sh
 | `6` | 重置管理员密码并打印账号/随机密码 |
 | `0` | 退出 |
 
-**NapCat 版本固定跟随上游 [BUGDey/qq-farm-bot](https://github.com/BUGDey/qq-farm-bot) 的 `v4.18.19`**，可用 `NAPCAT_VERSION` 覆盖。由于 NapNeko 官方发布源已不可用，脚本改从仍在维护的镜像仓库 `XingYunStar/NapCatQQ` 下载，并按 `ghfast.top` → `gh-proxy.com` → `ghproxy.net` → 直连的顺序逐个尝试，全部失败才会报错；也可用 `NAPCAT_ZIP_URL` 直接指定一个可用的 `NapCat.Shell.zip` 地址。脚本只下载 **NapCat Shell 包**，不会去猜或强制更换原版 QQ 客户端版本。
+**NapCat 版本固定跟随上游 [BUGDey/qq-farm-bot](https://github.com/BUGDey/qq-farm-bot) 的 `v4.18.19`**，可用 `NAPCAT_VERSION` 覆盖。由于 NapNeko 官方发布源已不可用，脚本改从仍在维护的镜像仓库 `XingYunStar/NapCatQQ` 下载，并按 `ghfast.top` → `gh-proxy.com` → `ghproxy.net` → 直连的顺序逐个尝试，全部失败才会报错；也可用 `NAPCAT_IMAGE_TAR_URL` / `NAPCAT_ZIP_URL` 直接指定可用的离线镜像包或 `NapCat.Shell.zip` 地址。
+
+关于 QQ 客户端：**NapCat 不是独立程序，而是注入 QQ 客户端进程的插件**，自身不带 `wrapper.node`，必须由 QQ 主进程加载才能拿到 NTQQ 原生接口，所以只装 `NapCat.Shell.zip` 是跑不起来的。另一方面，腾讯的 LinuxQQ deb 下载地址（`qqdl.gtimg.cn`）已对脚本返回 403、`dldir1.qq.com` 全线 404，也没有可用的裸 deb 镜像。因此脚本改为下载官方 `napcat-docker` 的**离线镜像 tar 包**（`napcat-docker-<版本>-<架构>.tar`，约 570MB），再按 OCI 层级把里面的 `/opt/QQ` 和配套的 `NapCat.Shell.zip` 直接解出来用——不需要 Docker 守护进程，也不访问腾讯下载服务器，且 QQ 与 NapCat 是镜像作者配好的一对。若镜像包里已存在 `/opt/QQ/qq` 则跳过这一步；仍可用 `LINUXQQ_DEB_URL` 强制走 deb 安装。
 
 选项 `3`（源码 + 原生 NapCat）流程：
 
-1. 下载并校验 `NapCat.Shell.zip`（`unzip -t`），解压到 `napcat/shell/`；
-2. 安装 LinuxQQ 客户端（已有 `/opt/QQ/qq` 则跳过），安装包地址从官方 `pcConfig.json` 实时解析，可用 `LINUXQQ_DEB_URL` 覆盖；
+1. 下载并校验离线镜像包（已有则直接复用），从里面取出配套的 `NapCat.Shell.zip`（`unzip -t` 校验后解压到 `napcat/shell/`）；镜像包内缺失时才回退到单独下载 Shell 包；
+2. 从同一个离线镜像包里提取 `/opt/QQ`（含 `wrapper.node`）安装到 `/opt/QQ`，只补齐缺失的系统库（`libnss3`、`libgbm1`、`libasound2`、`libgtk-3-0` 等），并设置 `chrome-sandbox` 权限；
 3. 把 NapCat 复制到 `/opt/QQ/resources/app/app_launcher/napcat`，写入 `loadNapCat.js`，并把 `/opt/QQ/resources/app/package.json` 的 `main` 指向它；
-4. 用 NapCat 包内 `qqnt.json` 的 `linuxVersion` / `linuxVerHash` 对齐 `~/.config/QQ/versions/config.json`，避免客户端版本与 NapCat 期望版本不一致导致挂载失败；
-5. 拉取上游 [qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth)、安装 `qq-miniapp-openauth` 插件（写入 `config/plugins.json` 并在 `napcat.mjs` 白名单中登记，改动前自动备份 `napcat.mjs.bak.<时间戳>`）；
-6. 把 OneBot HTTP 服务配到 `127.0.0.1:3000`；
-7. 把「NapCat 接口地址」（`napCatEndpoint`，默认 `http://127.0.0.1:8787`）和「接口签名」（`napCatSignature`，即 `API_SIGNING_SECRET`）写入 `core/data/store.json`，省去在「设置 → 系统设置 → 登录设置」里手动填写；
-8. 后台启动 NapCat（`xvfb-run`）与 qq-miniapp-auth，最后启动农场源码。
+4. 拉取上游 [qq-miniapp-auth](https://github.com/liyangpengs/qq-miniapp-auth)、安装 `qq-miniapp-openauth` 插件（写入 `config/plugins.json` 并在 `napcat.mjs` 白名单中登记，改动前自动备份 `napcat.mjs.bak.<时间戳>`）；
+5. 把 OneBot HTTP 服务配到 `127.0.0.1:3000`；
+6. 把「NapCat 接口地址」（`napCatEndpoint`，默认 `http://127.0.0.1:8787`）和「接口签名」（`napCatSignature`，即 `API_SIGNING_SECRET`）写入 `core/data/store.json`，省去在「设置 → 系统设置 → 登录设置」里手动填写；
+7. 后台启动 NapCat（`xvfb-run`）与 qq-miniapp-auth，最后启动农场源码。
 
-选项 `4`（Docker NapCat）流程与 `3` 相同，但 NapCat 运行在容器里：脚本生成 `napcat/docker/` 构建上下文（`Dockerfile` + `entrypoint.sh`），基础镜像默认 `mlikiowa/napcat-docker:v4.18.19`。镜像先尝试 `docker pull`（超时 60 秒即放弃），失败则自动下载官方同版本离线 tar 包并用 `docker load` 导入，避免 Docker Hub 不可达时卡死。容器内 OneBot 绑定 `0.0.0.0` 并通过端口映射暴露，农场容器经 `host.docker.internal:3000` 访问，可用 `export NAPCAT_HOST_IP=<局域网 IP>` 覆盖。
+选项 `4`（Docker NapCat）流程与 `3` 相同，但 NapCat 运行在容器里：脚本生成 `napcat/docker/` 构建上下文（`Dockerfile` + `entrypoint.sh`），基础镜像默认 `mlikiowa/napcat-docker:v4.18.19`。镜像先尝试 `docker pull`（超时 60 秒即放弃），失败则用上面同一份离线 tar 包 `docker load` 导入，避免 Docker Hub 不可达时卡死。容器内 OneBot 绑定 `0.0.0.0` 并通过端口映射暴露，农场容器经 `host.docker.internal:3000` 访问，可用 `export NAPCAT_HOST_IP=<局域网 IP>` 覆盖。
 
 所有配置全自动完成，不再交互询问签名或地址：`API_ENDPOINT`、`API_SECRET`、`ONEBOT_PORT` 都有默认值，可用同名环境变量覆盖；`ONEBOT_TOKEN` 首次运行时自动随机生成。
 
