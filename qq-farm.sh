@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-17.1"
+SCRIPT_VERSION="2026-11-17.2"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -155,6 +155,79 @@ require_root_ability(){
   if [[ "$IS_ROOT" -eq 0 ]]; then
     command -v sudo >/dev/null 2>&1 || die '当前不是 root 且没有 sudo，无法安装系统依赖'
   fi
+}
+
+# 安装前预检：先把所有前置条件查一遍，全部通过再开始安装，避免装到一半才报错。
+# shellcheck disable=SC2317
+preflight_install(){
+  local mode="${1:-shell}" problems=0
+  local -a missing=()
+
+  need_project
+
+  info '安装前检查运行环境…'
+
+  # 1. 通用命令
+  local c
+  for c in curl tar node npm unzip; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("命令 $c")
+  done
+  # Node >= 20：授权服务与国产 QQ wrapper 都要 Node 20+
+  if command -v node >/dev/null 2>&1; then
+    local nver
+    nver="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+    if [[ "$nver" =~ ^[0-9]+$ ]] && (( nver < 20 )); then
+      missing+=("Node.js 版本需 >= 20（当前 $(node --version 2>/dev/null || echo "主版本 $nver")）")
+    fi
+  fi
+
+  # 2. CPU 架构（QQ / NapCat 只支持 amd64、arm64）
+  if ! qq_arch >/dev/null 2>&1; then
+    missing+=("CPU 架构不支持：$(uname -m)（仅支持 x86_64/amd64、aarch64/arm64）")
+  fi
+
+  # 3. 系统包管理器（Shell 安装缺依赖时要能补装）
+  if [[ "$mode" == 'shell' ]]; then
+    if ! command -v apt-get >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1 && ! command -v yum >/dev/null 2>&1; then
+      missing+=('系统包管理器（apt-get / dnf / yum，用于补装 QQ 运行依赖）')
+    fi
+    if [[ "$IS_ROOT" -eq 0 ]] && ! command -v sudo >/dev/null 2>&1; then
+      missing+=('root 权限或 sudo（用于安装系统依赖）')
+    fi
+  fi
+
+  # 4. Docker 模式专属
+  if [[ "$mode" == 'docker' ]]; then
+    command -v docker >/dev/null 2>&1 || missing+=('命令 docker')
+    if command -v docker >/dev/null 2>&1; then
+      docker info >/dev/null 2>&1 || missing+=('Docker 守护进程未运行，或当前用户无权访问（需 root 或加入 docker 组）')
+      if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+        missing+=('Docker Compose（apt install docker-compose-plugin / dnf install docker-compose-plugin）')
+      fi
+    fi
+  fi
+
+  # 5. 磁盘空间：软链包缓存约需 1.5G，这里只做宽松提醒
+  local avail=''
+  if command -v df >/dev/null 2>&1; then
+    avail="$(df -Pm "$ROOT_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+    if [[ "$avail" =~ ^[0-9]+$ ]] && (( avail < 2048 )); then
+      missing+=("可用磁盘空间不足 2G（当前约 ${avail}M，下载缓存与 QQ 客户端需要空间）")
+    fi
+  fi
+
+  if (( ${#missing[@]} > 0 )); then
+    printf '\033[31m[FAIL]\033[0m 安装前检查未通过，请先处理下列问题：\n' >&2
+    local m
+    for m in "${missing[@]}"; do
+      printf '  - %s\n' "$m" >&2
+    done
+    printf '\033[31m[FAIL]\033[0m 处理完后再重新选择安装。\n' >&2
+    return 1
+  fi
+
+  ok "安装前检查通过（系统：$(uname -s) $(uname -m)；Node：$(node --version 2>/dev/null || echo '?')）"
+  return 0
 }
 
 # ---------------------------------------------------------------- 状态与配置
@@ -1552,6 +1625,7 @@ menu(){
       1) start_source;;
       2) start_docker;;
       3)
+        preflight_install shell || { warn '环境检查未通过，已取消安装，请处理后重试'; continue; }
         read_settings
         install_napcat_shell
         install_auth_service
@@ -1563,6 +1637,7 @@ menu(){
         start_source
         ;;
       4)
+        preflight_install docker || { warn '环境检查未通过，已取消安装，请处理后重试'; continue; }
         read_settings
         install_napcat_docker
         install_auth_service
