@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-17.2"
+SCRIPT_VERSION="2026-11-17.3"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -1632,9 +1632,11 @@ menu(){
         install_napcat_plugin
         configure_napcat
         configure_source
+        # 农场服务按选项 1 的方式后台启动；先起农场，再拉起 NapCat/授权服务。
+        # 这样即使 NapCat 的 QQ 登录暂时没就绪，面板也已经在后台运行。
+        start_source
         start_auth_service
         start_napcat
-        start_source
         ;;
       4)
         preflight_install docker || { warn '环境检查未通过，已取消安装，请处理后重试'; continue; }

@@ -178,7 +178,7 @@ chmod +x ./qq-farm.sh
 | --- | --- |
 | `1` | 源码后台启动（源码有改动时才重新构建 Web/Core，然后后台运行 `node core/client.js`） |
 | `2` | Docker Compose 启动 |
-| `3` | 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Shell 安装，不使用 Docker**） |
+| `3` | 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Shell 安装，不使用 Docker**；农场面板与选项 `1` 一样后台启动，只是多了自动配置 NapCat 这一步） |
 | `4` | Docker 启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Docker 安装**） |
 | `5` | 重启 NapCat |
 | `6` | 重置管理员密码并打印访问地址、账号与新密码 |
