@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-17.9"
+SCRIPT_VERSION="2026-11-17.10"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -848,7 +848,7 @@ install_napcat_docker(){
   read_settings
   info '========== NapCat Docker 安装 =========='
   ensure_napcat_image
-  mkdir -p "$NAPCAT_DIR/docker/config" "$NAPCAT_DIR/docker/plugins" "$NAPCAT_DIR/docker/QQ"
+  mkdir -p "$NAPCAT_DIR/docker/config" "$NAPCAT_DIR/docker/plugins" "$NAPCAT_DIR/docker/QQ" "$NAPCAT_DIR/docker/cache"
   docker rm -f "$NAPCAT_CONTAINER" >/dev/null 2>&1 || true
   local uid gid
   uid="$(id -u)"; gid="$(id -g)"
@@ -859,6 +859,7 @@ install_napcat_docker(){
     -p "127.0.0.1:6099:6099" -p "127.0.0.1:${ONEBOT_PORT}:3000" \
     -v "$NAPCAT_DIR/docker/config:/app/napcat/config" \
     -v "$NAPCAT_DIR/docker/plugins:/app/napcat/plugins" \
+    -v "$NAPCAT_DIR/docker/cache:/app/napcat/cache" \
     -v "$NAPCAT_DIR/docker/QQ:/app/.config/QQ" \
     "$NAPCAT_IMAGE" >/dev/null || die "容器创建失败，请手动执行 docker logs $NAPCAT_CONTAINER 排查"
   NAPCAT_MODE="docker"
@@ -1129,6 +1130,9 @@ stop_auth_service(){
 restart_auth_service(){
   info '正在重启 qq-miniapp-auth（会清空卡住的扫码登录状态）…'
   stop_auth_service
+  # 目录匹配清理可能漏掉工作目录不同的旧进程（例如之前从别处启动的），
+  # 它们仍占着 8787/9010 会让新服务启动失败或让健康检查误判为"已在运行"。
+  free_auth_ports
   start_auth_service
 }
 
@@ -1137,9 +1141,16 @@ restart_auth_service(){
 write_qr_image_path(){
   [[ -f "$AUTH_DIR/.env" ]] || return 1
   local root qr
-  root="${NAPCAT_ROOT:-}"
-  [[ -n "$root" ]] || root="$(napcat_detect_root 2>/dev/null || true)"
-  [[ -n "$root" ]] || root="$HOME/Napcat/opt/QQ/resources/app/app_launcher/napcat"
+  if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
+    # Docker：容器里 NapCat 的 cachePath 是 /app/napcat/cache，已挂到宿主机这个目录
+    root="$NAPCAT_DIR/docker"
+    mkdir -p "$root/cache"
+  else
+    root="${NAPCAT_ROOT:-}"
+    [[ -n "$root" ]] || root="$(napcat_detect_root 2>/dev/null || true)"
+    [[ -n "$root" ]] || root="$HOME/Napcat/opt/QQ/resources/app/app_launcher/napcat"
+    mkdir -p "$root/cache" 2>/dev/null || true
+  fi
   qr="$root/cache/qrcode.png"
   local changed
   changed="$(node -e '
@@ -1399,10 +1410,9 @@ configure_napcat(){
   ok "NapCat OneBot HTTP 服务已配置：$([[ "${NAPCAT_MODE:-}" == 'docker' ]] && echo 0.0.0.0 || echo 127.0.0.1):$ONEBOT_PORT"
   info "qq-miniapp-auth API 地址：$API_ENDPOINT"
   # 二维码文件兜底：NapCat 未登录时 OneBot(3000) 不监听，二维码从 cache/qrcode.png 读。
-  # 路径变化时重启授权服务，让新的 NAPCAT_QR_IMAGE_PATH 生效。
-  if [[ "${NAPCAT_MODE:-}" != 'docker' ]]; then
-    if write_qr_image_path; then restart_auth_service; fi
-  fi
+  # 路径变化时重启授权服务，让新的 NAPCAT_QR_IMAGE_PATH 生效。Docker 模式同样要写，
+  # 否则授权服务的 NAPCAT_QR_IMAGE_PATH 一直是空的（qrFileConfigured=false）。
+  if write_qr_image_path; then restart_auth_service; fi
   if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
     docker restart "$NAPCAT_CONTAINER" >/dev/null 2>&1 || warn 'NapCat 容器重启失败，请手动执行 docker restart'
     sleep 3
@@ -1478,6 +1488,9 @@ configure_docker(){
 start_napcat(){
   load_state
   if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
+    # 未登录阶段 OneBot 不监听，二维码靠 cache/qrcode.png 兜底；每次启动都确保
+    # 授权服务 .env 里的 NAPCAT_QR_IMAGE_PATH 指向容器挂出来的 cache 目录。
+    if write_qr_image_path; then restart_auth_service; fi
     docker start "$NAPCAT_CONTAINER" >/dev/null 2>&1 || true
     sleep 3
     local status=''

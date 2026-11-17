@@ -236,6 +236,8 @@ NapCat 的安装与配置是**幂等**的：脚本先检查已有安装，已装
 
 Docker 模式下，农场容器访问的是宿主机上的 `qq-miniapp-auth`，所以：`docker-compose.yml` 已加 `host.docker.internal:host-gateway`；授权服务在 Docker 模式下监听 `0.0.0.0:8787`（源码模式仍只监听 `127.0.0.1`）；写进农场容器的 `napCatEndpoint` 会自动把回环地址替换成 `http://host.docker.internal:8787`。如需改宿主地址，设 `NAPCAT_HOST_IP`（或 `AUTH_HOST_IP`）。如果之前已经装过且面板报「无法连接 NapCat 接口」，重新运行一次菜单 **2 → 2**（Docker 启动 + 全自动安装配置），它会让 compose 加载新配置、把授权服务改为监听 `0.0.0.0`、并刷新农场容器里的接口地址。
 
+Docker 模式的二维码兜底：NapCat 容器里的二维码写在 `/app/napcat/cache/qrcode.png`，脚本会把这个目录挂到宿主机的 `napcat/docker/cache/`，并把该绝对路径写进授权服务的 `NAPCAT_QR_IMAGE_PATH`（路径变化会重启授权服务使其生效）。未登录阶段 OneBot `3000` 端口可能不监听，此时二维码靠这个文件读取。因此仅看 `3000` 端口判断二维码链路并不准确；可在服务器用 `curl -s http://127.0.0.1:8787/api/health` 查看 `qrFileConfigured` 是否为 `true`。若面板一直「正在获取二维码」，先运行菜单 **5 → 3** 重启 NapCat 让缓存与配置重新加载。
+
 所有配置全自动完成，不再交互询问签名或地址：`API_ENDPOINT`、`API_SECRET`、`ONEBOT_PORT` 都有默认值，可用同名环境变量覆盖；`ONEBOT_TOKEN` 首次运行时自动随机生成。
 
 脚本会把生成的目录放在脚本所在目录：`napcat/`（下载缓存 `NapCat.Shell.zip`、`QQ.deb`、配置、日志、旧版备份）、`qq-miniapp-auth/`（授权服务源码）。配置持久化在 `napcat/manager-config.env`（`API_ENDPOINT`、`API_SECRET`、`ONEBOT_PORT`、`ONEBOT_TOKEN`、`NAPCAT_ROOT`、`NAPCAT_MODE`）。源码后台日志写入 `app_linux.log` / `app_linux.error.log`，进程号记录在 `app_linux.pid`；NapCat 日志与进程号分别是 `napcat/napcat.log` 和 `napcat/napcat.pid`；NapCat 安装器的完整输出在 `napcat/napcat-install.log`。两个生成目录已加入 `.gitignore`，不会污染仓库。
