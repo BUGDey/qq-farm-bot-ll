@@ -1758,8 +1758,8 @@ menu_default(){
 menu_auto(){
   while true; do
     printf '\n---- 自动配置版（自动安装并配置 NapCat 与 qq-miniapp-auth）----\n'
-    printf '1. 源码启动 + 全自动安装配置 NapCat（Shell 安装，不使用 Docker）\n'
-    printf '2. Docker 启动 + 全自动安装配置 NapCat（Docker 安装）\n'
+    printf '1. 源码启动 + 全自动安装配置 NapCatShell\n'
+    printf '2. Docker 启动 + 全自动安装配置 NapCat\n'
     printf '3. 启动源码\n'
     printf '4. 停止源码\n'
     printf '5. 重启源码\n'
