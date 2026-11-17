@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-17.5"
+SCRIPT_VERSION="2026-11-17.6"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -1492,13 +1492,45 @@ pnpm_install_multi(){
   return 1
 }
 
+# 列出监听指定 TCP 端口的进程 PID（尽力而为，逐行去重；工具缺失时返回空）
+port_listen_pids(){
+  local port="$1" pids='' x
+  if command -v fuser >/dev/null 2>&1; then
+    x="$(fuser -n tcp "$port" 2>&1 | grep -oE '[0-9]+' || true)"
+    pids="$pids $x"
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    x="$(ss -ltnpH "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 || true)"
+    pids="$pids $x"
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    x="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    pids="$pids $x"
+  fi
+  printf '%s\n' "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u || true
+}
+
 source_running(){
-  [[ -f "$SOURCE_PID" ]] || return 1
-  local pid; pid="$(cat "$SOURCE_PID" 2>/dev/null || true)"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  local cmd; cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-  [[ "$cmd" == *core/client.js* ]]
+  # 先按 PID 文件判断
+  if [[ -f "$SOURCE_PID" ]]; then
+    local pid; pid="$(cat "$SOURCE_PID" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      local cmd; cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+      [[ "$cmd" == *core/client.js* ]] && return 0
+    fi
+  fi
+  # PID 文件失效时，按端口找出真正在跑的服务并回写 PID，避免重复启动撞端口
+  local port; port="$(farm_port)"
+  local p pids; pids="$(port_listen_pids "$port")"
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    local pcmd; pcmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)"
+    if [[ "$pcmd" == *core/client.js* ]]; then
+      printf '%s' "$p" > "$SOURCE_PID"
+      return 0
+    fi
+  done <<< "$pids"
+  return 1
 }
 
 # 构建产物比源码旧（或不存在）时才重新构建，避免每次启动都重跑一遍构建。
@@ -1640,16 +1672,24 @@ stop_farm(){
     compose_stop
     ok '农场 Docker 已停止'
   else
+    local pids='' pid
     if [[ -f "$SOURCE_PID" ]]; then
-      local pid
       pid="$(tr -d '[:space:]' < "$SOURCE_PID" 2>/dev/null || true)"
-      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        sleep 1
-        kill -9 "$pid" 2>/dev/null || true
-      fi
-      rm -f "$SOURCE_PID"
+      [[ -n "$pid" ]] && pids="$pids $pid"
     fi
+    # PID 文件可能已失效，再从监听端口找出真正占着端口的农场进程
+    local port; port="$(farm_port)"
+    pids="$pids $(port_listen_pids "$port")"
+    for pid in $pids; do
+      local pcmd; pcmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+      [[ "$pcmd" == *core/client.js* ]] || continue
+      kill "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    for pid in $pids; do
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    rm -f "$SOURCE_PID"
     ok '农场源码服务已停止'
   fi
 }
