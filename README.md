@@ -232,7 +232,9 @@ NapCat 的安装与配置是**幂等**的：脚本先检查已有安装，已装
 7. 把「NapCat 接口地址」（`napCatEndpoint`，默认 `http://127.0.0.1:8787`）和「接口签名」（`napCatSignature`，即 `API_SIGNING_SECRET`）写入 `core/data/store.json`，省去在「设置 → 系统设置 → 登录设置」里手动填写；
 8. 后台启动 NapCat（`xvfb-run -a ~/Napcat/opt/QQ/qq --no-sandbox`）与 qq-miniapp-auth，最后启动农场源码。
 
-选项 `4`（Docker 安装的 NapCat）流程与 `3` 大致相同，但 NapCat 运行在容器里：脚本直接使用官方镜像 `mlikiowa/napcat-docker:v4.18.19`（不再自建 Dockerfile），容器名 `qq-farm-napcat`，`NAPCAT_UID/GID` 用当前用户，三个具名目录 `napcat/docker/{config,plugins,QQ}` 分别挂到 `/app/napcat/config`、`/app/napcat/plugins`、`/app/.config/QQ`；WebUI 与 OneBot 都只映射到 `127.0.0.1`（`6099` 与 `$ONEBOT_PORT`）。容器内 OneBot 绑定 `0.0.0.0`，农场容器经 `host.docker.internal:3000` 访问，可用 `export NAPCAT_HOST_IP=<局域网 IP>` 覆盖。
+选项 `4`（Docker 安装的 NapCat）流程与 `3` 大致相同，但 NapCat 运行在容器里：脚本直接使用官方镜像 `mlikiowa/napcat-docker:v4.18.19`（不再自建 Dockerfile），容器名 `qq-farm-napcat`，`NAPCAT_UID/GID` 用当前用户，三个具名目录 `napcat/docker/{config,plugins,QQ}` 分别挂到 `/app/napcat/config`、`/app/napcat/plugins`、`/app/.config/QQ`；WebUI 与 OneBot 都只映射到 `127.0.0.1`（`6099` 与 `$ONEBOT_PORT`）。容器内 OneBot 绑定 `0.0.0.0`，并映射到宿主机 `127.0.0.1:$ONEBOT_PORT`（默认 3000）供宿主机上的授权服务访问；容器端口映射用 `127.0.0.1` 是为了不对外暴露。
+
+Docker 模式下，农场容器访问的是宿主机上的 `qq-miniapp-auth`，所以：`docker-compose.yml` 已加 `host.docker.internal:host-gateway`；授权服务在 Docker 模式下监听 `0.0.0.0:8787`（源码模式仍只监听 `127.0.0.1`）；写进农场容器的 `napCatEndpoint` 会自动把回环地址替换成 `http://host.docker.internal:8787`。如需改宿主地址，设 `NAPCAT_HOST_IP`（或 `AUTH_HOST_IP`）。如果之前已经装过且面板报「无法连接 NapCat 接口」，重新运行一次菜单 **2 → 2**（Docker 启动 + 全自动安装配置），它会让 compose 加载新配置、把授权服务改为监听 `0.0.0.0`、并刷新农场容器里的接口地址。
 
 所有配置全自动完成，不再交互询问签名或地址：`API_ENDPOINT`、`API_SECRET`、`ONEBOT_PORT` 都有默认值，可用同名环境变量覆盖；`ONEBOT_TOKEN` 首次运行时自动随机生成。
 

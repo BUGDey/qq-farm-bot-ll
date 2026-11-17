@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-17.8"
+SCRIPT_VERSION="2026-11-17.9"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -897,12 +897,16 @@ install_auth_service(){
   fi
   read_settings
   local webui_config="${NAPCAT_ROOT:-$NAPCAT_DIR}/config/webui.json"
+  # Docker 模式下农场容器经 host.docker.internal 访问宿主机，授权服务必须监听 0.0.0.0；
+  # 源码模式仍只监听回环，避免不必要地对外暴露。
+  local auth_host='127.0.0.1'
+  [[ "${NAPCAT_MODE:-}" == 'docker' ]] && auth_host='0.0.0.0'
   node -e '
 const fs = require("fs");
-const [path, secret, onebot, webuiCfg, onebotPort] = process.argv.slice(1);
+const [path, secret, onebot, webuiCfg, onebotPort, authHost] = process.argv.slice(1);
 let s = fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
 const values = {
-  HOST: "127.0.0.1",
+  HOST: authHost,
   PORT: "8787",
   NAPCAT_API_URL: "http://127.0.0.1:" + onebotPort,
   NAPCAT_TOKEN: onebot,
@@ -921,7 +925,7 @@ for (const [k, v] of Object.entries(values)) {
   else s += (s === "" || s.endsWith("\n") ? "" : "\n") + line + "\n";
 }
 fs.writeFileSync(path, s);
-' "$AUTH_DIR/.env" "$API_SECRET" "$ONEBOT_TOKEN" "$webui_config" "$ONEBOT_PORT"
+' "$AUTH_DIR/.env" "$API_SECRET" "$ONEBOT_TOKEN" "$webui_config" "$ONEBOT_PORT" "$auth_host"
   chmod 600 "$AUTH_DIR/.env" 2>/dev/null || true
   if [[ -d "$AUTH_DIR/node_modules" && -f "$AUTH_DIR/node_modules/.package-lock.json" ]]; then
     ok 'qq-miniapp-auth 依赖已安装，跳过 npm install'
@@ -1414,8 +1418,29 @@ configure_napcat(){
   fi
 }
 
+# Docker 模式下农场跑在容器里，容器内的 127.0.0.1 是容器自己，
+# 不能用来访问宿主机上的 qq-miniapp-auth。compose 里已配置 host.docker.internal:host-gateway，
+# 默认经它访问宿主机；可用 NAPCAT_HOST_IP / AUTH_HOST_IP 指定其它宿主机地址。
+docker_auth_endpoint(){
+  local host_ip="${NAPCAT_HOST_IP:-${AUTH_HOST_IP:-host.docker.internal}}"
+  host_ip="${host_ip#http://}"; host_ip="${host_ip#https://}"
+  host_ip="${host_ip%%/*}"
+  [[ -n "$host_ip" ]] || host_ip='host.docker.internal'
+  node -e '
+try {
+  const u = new URL(process.argv[1]);
+  u.hostname = process.argv[2];
+  console.log(u.toString().replace(/\/$/, ""));
+} catch (e) {
+  console.log("http://" + process.argv[2] + ":8787");
+}
+' "${API_ENDPOINT:-http://127.0.0.1:8787}" "$host_ip"
+}
+
 update_farm_store(){
   local file="$1"
+  local endpoint="${2:-$API_ENDPOINT}"
+  local secret="${3:-$API_SECRET}"
   node -e '
 const fs = require("fs");
 const [path, endpoint, secret] = process.argv.slice(1);
@@ -1426,7 +1451,7 @@ Object.assign(login, { qqQrLogin: true, napCatEndpoint: endpoint, napCatSignatur
 fs.mkdirSync(require("path").dirname(path), { recursive: true });
 fs.writeFileSync(path + ".tmp", JSON.stringify(obj, null, 2) + "\n");
 fs.renameSync(path + ".tmp", path);
-' "$file" "$API_ENDPOINT" "$API_SECRET"
+' "$file" "$endpoint" "$secret"
 }
 
 configure_source(){
@@ -1441,7 +1466,7 @@ configure_docker(){
   if ! docker cp "$CONTAINER_NAME:/app/core/data/store.json" "$tmp" >/dev/null 2>&1; then
     echo '{}' > "$tmp"
   fi
-  update_farm_store "$tmp"
+  update_farm_store "$tmp" "$(docker_auth_endpoint)" "$API_SECRET"
   docker cp "$tmp" "$CONTAINER_NAME:/app/core/data/store.json" >/dev/null
   docker restart "$CONTAINER_NAME" >/dev/null
   rm -f "$tmp"
@@ -1922,13 +1947,19 @@ auto_install_docker(){
     return 1
   fi
   read_settings
+  # 先标记 docker 模式，授权服务才会按容器可达的方式监听；
+  # NapCat 安装成功后会再次确认这个值。
+  NAPCAT_MODE='docker'
+  save_state
   install_napcat_docker
   install_auth_service
   install_napcat_plugin
   configure_napcat
   start_docker 1
   configure_docker
-  start_auth_service
+  # 授权服务的监听地址可能刚从源码模式的回环改成容器可达的地址，
+  # 必须真正重启才能生效（start_auth_service 见健康就跳过，不会重读 .env）。
+  restart_auth_service
   start_napcat
   if creds_shown; then
     report_panel_access 0
