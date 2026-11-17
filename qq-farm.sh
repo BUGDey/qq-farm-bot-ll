@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-17.6"
+SCRIPT_VERSION="2026-11-17.7"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -624,10 +624,21 @@ napcat_sudo_shim(){
 
 install_napcat_shell(){
   need curl; need tar; need node
-  require_root_ability
   read_settings
+  # 已装过就直接复用，不重复下载/执行安装器；只确保状态记录正确
+  if [[ "${NAPCAT_MODE:-}" == 'native' ]] && napcat_installed; then
+    ok 'NapCat Shell 已安装，跳过安装步骤（如需强制重装可先清空 napcat/ 目录）'
+    return 0
+  fi
+  require_root_ability
   cd_home
   info '========== NapCat Shell 安装 =========='
+  # 重装前先结束残留的 NapCat QQ 进程，避免多实例竞争导致 OneBot 端口不监听
+  local stale; stale="$(napcat_running_pids)"
+  if [[ -n "$stale" ]]; then
+    warn '检测到残留的 NapCat QQ 进程，先结束它们再安装'
+    kill_napcat_pids "$stale"
+  fi
   napcat_cleanup_old_install
   napcat_sudo_shim
   local installer zip
@@ -670,6 +681,54 @@ napcat_detect_qq(){
     if [[ -x "$c" ]]; then printf '%s\n' "$c"; return 0; fi
   done
   return 1
+}
+
+# NapCat 是否已装好：用于幂等——已装就跳过安装，只做配置与启动。
+# 只有状态里明确记录过对应模式时才跳过，避免首次运行时误把旧的系统级安装当成"已装"。
+napcat_installed(){
+  case "${NAPCAT_MODE:-}" in
+    native)
+      local root; root="$(napcat_detect_root 2>/dev/null || true)"
+      [[ -n "$root" && -f "$root/napcat.mjs" ]] || return 1
+      napcat_detect_qq >/dev/null 2>&1 || return 1
+      return 0
+      ;;
+    docker)
+      docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$NAPCAT_CONTAINER" || return 1
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# 列出当前在跑的 NapCat QQ 进程（xvfb-run 父进程与 qq 子进程都会命中）。
+# 重装或异常退出会留下多组进程；多实例竞争时只有持登录态的那个加载 OneBot 配置，
+# 另一个不监听 3000，二维码接口就会失败。启动前据此清理，保证只有一个实例。
+napcat_running_pids(){
+  local p cmd
+  for p in $(pgrep -f 'Napcat/opt/QQ/qq|app_launcher/napcat' 2>/dev/null || true); do
+    [[ "$p" == "$$" ]] && continue
+    cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)"
+    case "$cmd" in
+      *"Napcat/opt/QQ/qq"*|*"app_launcher/napcat"*) printf '%s\n' "$p" ;;
+    esac
+  done | sort -u
+}
+
+kill_napcat_pids(){
+  local pids="$1" p
+  [[ -n "$pids" ]] || return 0
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    kill -TERM "$p" 2>/dev/null || true
+  done <<< "$pids"
+  sleep 2
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    kill -9 "$p" 2>/dev/null || true
+  done <<< "$pids"
 }
 
 cd_home(){ cd "$HOME" || die "无法进入 $HOME"; }
@@ -1229,6 +1288,19 @@ fs.writeFileSync(path, JSON.stringify(obj, null, 2) + "\n");
 ' "$file" "$ONEBOT_PORT" "$ONEBOT_TOKEN" "$bind_host"
 }
 
+# OneBot HTTP 端口是否已在监听（NapCat 真正加载配置的判据）
+onebot_listening(){
+  local pids; pids="$(port_listen_pids "$ONEBOT_PORT")"
+  [[ -n "$pids" ]] && return 0
+  if command -v curl >/dev/null 2>&1; then
+    local code
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$ONEBOT_PORT/" 2>/dev/null || true)"
+    # 只要不是 000（连不上），即使返回 4xx 也说明端口在监听、NapCat 已加载配置
+    [[ -n "$code" && "$code" != '000' ]] && return 0
+  fi
+  return 1
+}
+
 configure_napcat(){
   read_settings
   local cfg_dir
@@ -1262,6 +1334,14 @@ configure_napcat(){
     docker restart "$NAPCAT_CONTAINER" >/dev/null 2>&1 || warn 'NapCat 容器重启失败，请手动执行 docker restart'
     sleep 3
     ok 'NapCat 容器已重启以加载 OneBot 配置'
+  else
+    # 原生模式下 NapCat 正在跑时，配置改动必须重启才会生效；否则配置写了但端口不监听
+    local running; running="$(napcat_running_pids)"
+    if [[ -n "$running" ]]; then
+      info 'NapCat 正在运行，重启以加载新的 OneBot 配置…'
+      kill_napcat_pids "$running"
+      rm -f "$NAPCAT_PID"
+    fi
   fi
 }
 
@@ -1315,6 +1395,20 @@ start_napcat(){
   local qq
   qq="$(napcat_detect_qq || true)"
   [[ -n "$qq" ]] || die "未找到 QQ 可执行文件（$HOME/Napcat/opt/QQ/qq 或 /opt/QQ/qq）"
+
+  # 只要 OneBot 端口已经在监听，说明 NapCat 已带配置正常运行，直接复用，不再拉起第二个实例
+  if onebot_listening; then
+    ok "NapCat 的 OneBot 服务已在监听 $ONEBOT_PORT，跳过重复启动"
+    return 0
+  fi
+
+  # 清理残留的 NapCat QQ 进程：多实例竞争会导致只有一个加载 OneBot 配置，
+  # 另一个不监听 3000，二维码接口取不到数据。启动前保证从单实例开始。
+  local stale; stale="$(napcat_running_pids)"
+  if [[ -n "$stale" ]]; then
+    warn '检测到残留的 NapCat QQ 进程，先结束它们，保证只有一个实例加载配置'
+    kill_napcat_pids "$stale"
+  fi
   if [[ -f "$NAPCAT_PID" ]] && kill -0 "$(cat "$NAPCAT_PID" 2>/dev/null || echo 0)" 2>/dev/null; then
     ok "NapCat 已在运行，PID $(cat "$NAPCAT_PID")"
     return 0
@@ -1350,6 +1444,20 @@ start_napcat(){
     ((i++)) || true
   done
   ok "NapCat 已后台启动，PID=$pid，日志：$NAPCAT_LOG"
+  # OneBot HTTP 服务要在 NapCat 成功加载 QQ 登录态与配置后才会监听；
+  # 这里再等最多 30 秒，超时给明确提示，避免面板拿到一个没起来的 3000 端口。
+  local w=0
+  while ((w < 30)); do
+    onebot_listening && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+    ((w++)) || true
+  done
+  if onebot_listening; then
+    ok "NapCat OneBot HTTP 服务已在监听 $ONEBOT_PORT"
+  else
+    warn "NapCat 进程已起，但 OneBot 端口 $ONEBOT_PORT 尚未监听：通常需要在 WebUI 扫码登录 QQ 后才会加载配置；请打开 WebUI 完成登录：http://127.0.0.1:6099/webui/"
+  fi
   info '打开 NapCat WebUI 扫码登录 QQ：http://127.0.0.1:6099/webui/'
 }
 

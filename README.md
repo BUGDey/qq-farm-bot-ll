@@ -215,6 +215,8 @@ NapNeko 官方的安装器与发布地址已经失效（`NapNeko/NapCatQQ` 的 r
 
 关于 QQ 客户端：**NapCat 不是独立程序，而是注入 QQ 客户端进程的插件**，自身不带 `wrapper.node`，必须由 QQ 主进程加载才能拿到 NTQQ 原生接口，所以只装 `NapCat.Shell.zip` 跑不起来——installer 会用 `dpkg -x` / `rpm2cpio` 把 QQ 解包到 `~/Napcat/opt/QQ`，全程不需要 root 也不需要系统包管理器安装。QQ 安装包默认从 [zydou/QQ-Linux](https://github.com/zydou/QQ-Linux) 的 release 取（先查 API 取最新，失败回退已知 tag），可用 `QQ_PKG_URL` 指定；两者的下载包都缓存在 `napcat/` 下，重装不会重复下载。
 
+NapCat 的安装与配置是**幂等**的：脚本先检查是否已装过 NapCat（Shell 模式查 `~/Napcat` 下的 NapCat 目录与 QQ 可执行文件，Docker 模式查 `qq-farm-napcat` 容器）。已装好就跳过下载与安装器，只做配置和启动；重装会先结束残留的 NapCat QQ 进程。这一点很重要——NapCat 是多实例竞争的：只有真正持有 QQ 登录态的那个实例会加载 OneBot 网络配置并监听 `127.0.0.1:3000`，重复安装留下的多个 `xvfb-run .../qq --no-sandbox` 进程会让端口无人监听，面板就显示「二维码不可用 / NapCat 接口返回失败」。脚本在启动前会按特征结束这些残留进程、保证单实例，并在启动后最多等 30 秒确认 OneBot 端口真正监听；配置改动也会重启 NapCat 让新配置生效。若面板仍失败，可打开 `http://127.0.0.1:6099/webui/` 确认 QQ 已扫码登录（未登录时 NapCat 不会加载 OneBot 配置），或用 NapCat 管理里的「重启 NapCat」再试。
+
 选项 `3`（源码 + Shell 安装的 NapCat）流程：
 
 1. 若检测到旧版系统级安装（`/opt/QQ/resources/app/app_launcher/napcat`），先备份其 `config/` 到 `napcat/napcat-config-backup.<时间戳>`，再把该 NapCat 目录挪走、把 QQ 的 `package.json` 恢复原样——否则 installer 会弹出「是否彻底删除旧版本」的交互提问，非交互环境下直接退出；
