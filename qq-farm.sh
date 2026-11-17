@@ -305,31 +305,28 @@ gh_url_variants(){
   printf '%s\n' "${out[@]}"
 }
 
-# 静默下载：不打印候选地址、不打印进度条，成功时什么都不输出（调用方自己打 ok）。
+# 下载时显示 curl 进度条，但隐藏候选地址；成功时不额外输出（调用方自己打 ok）。
 # 某个源彻底失败才 warn 一行，并把 curl 的最后一句原因带上（只带一句，不刷屏）。
 fetch_to(){
   local dest="$1"; shift
-  local url attempt err reason
-  local errf="$dest.curlerr"
+  local url attempt
   for url in "$@"; do
     [[ -n "$url" ]] || continue
-    # -fsS：不输出进度条，但把失败原因写进 errf（我们自己汇总成一行，不让 curl 刷屏）
+    # 不用 -s，让 curl 把下载进度输出到终端；失败原因单独汇总为一行。
     for attempt in 1 2 3; do
-      if curl -fsSL -S --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 3600 \
-          -A 'Mozilla/5.0' -o "$dest.part" "$url" 2>"$errf"; then
+      if curl -fL --progress-bar --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 3600 \
+          -A 'Mozilla/5.0' -o "$dest.part" "$url"; then
+        printf '\r\033[K' >&2
         mv "$dest.part" "$dest"
-        rm -f "$errf"
         return 0
       fi
+      printf '\r\033[K' >&2
       [[ "$attempt" -lt 3 ]] && sleep 2
     done
     rm -f "$dest.part"
-    reason="$(tail -n 1 "$errf" 2>/dev/null | tr -d '\r' || true)"
-    rm -f "$errf"
-    if [[ -n "$reason" ]]; then warn "源不可用，换下一个（$reason）：$url"
-    else warn "源不可用，换下一个：$url"; fi
+    warn "源不可用，换下一个：$url"
   done
-  rm -f "$dest.part" "$errf"
+  rm -f "$dest.part"
   return 1
 }
 
@@ -511,26 +508,24 @@ napcat_get_installer(){
     mapfile -t variants < <(gh_url_variants "$base")
     urls+=("${variants[@]}")
   done
-  local attempt reason
-  local errf="$dest.curlerr"
+  local attempt
   for try_url in "${urls[@]}"; do
     for attempt in 1 2; do
       # 不要写成 `head -n 1 | grep -q`：grep 命中即退出会让 head 收到 SIGPIPE，
       # 配合 pipefail 会把「下载成功」误判成失败。
-      if curl -fsSL -S --connect-timeout 20 --max-time 120 -o "$dest" "$try_url" 2>"$errf" \
+      if curl -fL --progress-bar --connect-timeout 20 --max-time 120 -o "$dest" "$try_url" \
           && [[ -s "$dest" ]] && [[ "$(head -c 2 "$dest")" == '#!' ]]; then
-        rm -f "$errf"
+        printf '\r\033[K' >&2
         ok 'NapCat 安装器已就绪'
         printf '%s\n' "$dest"
         return 0
       fi
+      printf '\r\033[K' >&2
       [[ "$attempt" -lt 2 ]] && sleep 2
     done
     rm -f "$dest"
   done
-  reason="$(tail -n 1 "$errf" 2>/dev/null | tr -d '\r' || true)"
-  rm -f "$errf"
-  die "NapCat 安装器下载失败（所有源都不可用）${reason:+：$reason}"
+  die 'NapCat 安装器下载失败（所有源都不可用）'
 }
 
 # installer 内部仍写死已失效的官方地址，执行前就地改成归档地址：
@@ -796,11 +791,11 @@ ensure_napcat_image(){
   local img_path="$NAPCAT_IMAGE_BASE:$NAPCAT_IMAGE_TAG"
   for prefix in "${DOCKER_MIRROR_PREFIXES[@]}"; do
     ref="${prefix}${img_path}"
-    info "拉取镜像：$ref"
+    info '正在拉取 NapCat 镜像…'
     if command -v timeout >/dev/null 2>&1; then
-      timeout 300 docker pull "$ref" >/dev/null 2>&1 || continue
+      timeout 300 docker pull "$ref" || continue
     else
-      docker pull "$ref" >/dev/null 2>&1 || continue
+      docker pull "$ref" || continue
     fi
     if [[ "$ref" != "$NAPCAT_IMAGE" ]]; then
       docker tag "$ref" "$NAPCAT_IMAGE" >/dev/null 2>&1 || true
