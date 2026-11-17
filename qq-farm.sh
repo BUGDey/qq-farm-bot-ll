@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-16.9"
+SCRIPT_VERSION="2026-11-17.1"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -851,22 +851,91 @@ npm_install_in(){
   return 1
 }
 
+# 授权服务健康端点：以 HTTP 200 判断服务是否真正在跑。
+# npm start 会再套一层 node 子进程，父进程退出后子进程可能仍占着端口，
+# 只看 PID 文件会误判成「没在跑」而重复启动，造成 8787/9010 EADDRINUSE。
+auth_health_url(){
+  printf '%s/api/health' "${API_ENDPOINT:-http://127.0.0.1:8787}"
+}
+
+auth_is_healthy(){
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$(auth_health_url)" 2>/dev/null || true)"
+  [[ "$code" == '200' ]]
+}
+
+# 结束本目录下残留的授权服务进程：命令行含服务入口、且工作目录就是 AUTH_DIR 才处理，
+# 不碰其他目录下的 node 进程。
+stop_auth_leftovers(){
+  local p cmd cwd
+  for p in $(pgrep -f 'start-all\.js|bridge\.js|server\.js' 2>/dev/null || true); do
+    [[ -r "/proc/$p/cmdline" ]] || continue
+    cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)"
+    cwd="$(readlink "/proc/$p/cwd" 2>/dev/null || true)"
+    local is_entry
+    is_entry=0
+    [[ "$cmd" == *start-all.js* || "$cmd" == *bridge.js* || "$cmd" == *server.js* ]] && is_entry=1
+    # 工作目录或命令行路径命中本目录才算，避免误杀其他项目的 node 服务
+    if [[ "$is_entry" == 1 ]] && { [[ "$cwd" == "$AUTH_DIR" ]] || [[ "$cmd" == *"$AUTH_DIR"* ]]; }; then
+      kill -TERM "$p" 2>/dev/null || true
+    fi
+  done
+  sleep 2
+}
+
+# 兜底：若上面按目录清理后端口仍被占（例如残留进程工作目录不同），
+# 用 fuser / lsof 结束占用授权服务端口的进程。只处理 8787 / 9010。
+free_auth_ports(){
+  local port holders
+  for port in 8787 9010; do
+    holders=''
+    if command -v fuser >/dev/null 2>&1; then
+      holders="$(fuser "$port/tcp" 2>/dev/null || true)"
+    elif command -v lsof >/dev/null 2>&1; then
+      holders="$(lsof -ti "tcp:$port" 2>/dev/null || true)"
+    fi
+    for p in $holders; do
+      kill -TERM "$p" 2>/dev/null || true
+    done
+  done
+  [[ -n "${holders:-}" ]] && sleep 2 || true
+}
+
 start_auth_service(){
   install_auth_service
   local pid_file="$AUTH_DIR/qq-miniapp-auth.pid"
-  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-    ok "qq-miniapp-auth 已在后台运行，PID $(cat "$pid_file")"
-    return
+  if auth_is_healthy; then
+    ok "qq-miniapp-auth 已在运行（服务响应正常）"
+    return 0
   fi
+  if [[ -f "$pid_file" ]]; then
+    local oldpid
+    oldpid="$(tr -d '[:space:]' < "$pid_file" 2>/dev/null || true)"
+    if [[ -n "$oldpid" ]] && kill -0 "$oldpid" 2>/dev/null; then
+      ok "qq-miniapp-auth 已在后台运行，PID $oldpid"
+      return 0
+    fi
+  fi
+  # 服务不可用：先清掉上次残留的进程，避免端口仍被占用
+  stop_auth_leftovers
+  auth_is_healthy || free_auth_ports
   local log="$AUTH_DIR/qq-miniapp-auth.log"
   pushd "$AUTH_DIR" >/dev/null
   nohup npm start >>"$log" 2>&1 </dev/null &
   local pid=$!
   echo "$pid" > "$pid_file"
   popd >/dev/null
-  sleep 3
+  local i
+  for ((i=0; i<15; i++)); do
+    auth_is_healthy && break
+    sleep 1
+  done
+  if auth_is_healthy; then
+    ok "qq-miniapp-auth 已后台启动，PID=$pid，日志：$log"
+    return 0
+  fi
   kill -0 "$pid" 2>/dev/null || die "qq-miniapp-auth 启动失败，请查看 $log"
-  ok "qq-miniapp-auth 已后台启动，PID=$pid，日志：$log"
+  die "qq-miniapp-auth 已启动但服务未就绪，请查看 $log"
 }
 
 stop_auth_service(){
@@ -882,11 +951,9 @@ stop_auth_service(){
     kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
   fi
   rm -f "$pid_file"
-  # 兜底：按命令行精确匹配本目录下的服务，不误杀别的 node 进程
-  pkill -TERM -f "$AUTH_DIR/start-all.js" 2>/dev/null || true
-  pkill -TERM -f "$AUTH_DIR/bridge.js" 2>/dev/null || true
-  pkill -TERM -f "$AUTH_DIR/server.js" 2>/dev/null || true
-  sleep 1
+  # 兜底：清掉工作目录在本目录下、命令行命中服务入口的残留进程；
+  # 它们才是真正占着 8787/9010 的进程，只杀 PID 文件里的 npm 父进程不够。
+  stop_auth_leftovers
   return 0
 }
 

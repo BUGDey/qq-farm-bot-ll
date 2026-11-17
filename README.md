@@ -189,6 +189,8 @@ chmod +x ./qq-farm.sh
 
 选项 `7` 用于 QQ 扫码登录页面一直提示「工作流繁忙」「刷新二维码没反应」的情况：它会读授权服务的 `/api/health` 显示当前是否有登录卡住，然后重启 qq-miniapp-auth（内存里的单例登录工作流随之清空），并让 NapCat 重启登录 worker，之后回面板重新点「刷新二维码」即可。正常情况下不需要手动用它——面板在刷新二维码时会先释放上一个任务再建新任务。
 
+qq-miniapp-auth 是否已启动以 `/api/health` 是否返回 200 为准，不只看 PID 文件：`npm start` 会多套一层 node 子进程，父进程退出后子进程仍可能占着 8787/9010，重复启动会报 `EADDRINUSE`。脚本启动前会先探测健康端点， unhealthy 时清掉本目录下残留的服务进程再启动。若手动重启后仍报端口被占，可先执行 `pkill -f 'qq-miniapp-auth/(bridge|server|start-all)\.js'` 清理，再选 `3` / `4` 或选项 `7`。
+
 **NapCat 版本固定跟随上游 [BUGDey/qq-farm-bot](https://github.com/BUGDey/qq-farm-bot) 的 `v4.18.19`**，可用 `NAPCAT_VERSION` 覆盖。
 
 NapNeko 官方的安装器与发布地址已经失效（`NapNeko/NapCatQQ` 的 release 资产为空、`NapNeko/NapCat-Installer` 仓库 404），所以两条链路改用下面这些仍可用的源：
