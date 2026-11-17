@@ -176,22 +176,23 @@ chmod +x ./qq-farm.sh
 
 | 选项 | 说明 |
 | --- | --- |
-| `1` | 源码后台启动（源码有改动时才重新构建 Web/Core，然后后台运行 `node core/client.js`） |
-| `2` | Docker Compose 启动 |
-| `3` | 源码启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Shell 安装，不使用 Docker**；农场面板与选项 `1` 一样后台启动，只是多了自动配置 NapCat 这一步） |
-| `4` | Docker 启动并全自动安装/配置 NapCat 与 qq-miniapp-auth（**Docker 安装**） |
-| `5` | 重启 NapCat |
+| `1` | 默认版 —— 进入子菜单选「源码后台启动」或「Docker 启动」（只启动农场，不碰 NapCat） |
+| `2` | 自动配置版 —— 进入子菜单选「源码」或「Docker」，自动安装并配置 NapCat 与 qq-miniapp-auth 后再启动 |
+| `5` | NapCat 管理 —— 进入子菜单：启动 / 停止 / 重启 NapCat、修复 QQ 扫码登录 |
 | `6` | 重置管理员密码并打印访问地址、账号与新密码 |
-| `7` | 修复 QQ 扫码登录（重置卡住的登录状态） |
 | `0` | 退出 |
 
-选择 `3` / `4` 开始安装前，脚本会先做一次环境预检：检查 `curl`、`tar`、`node`（要求 Node.js ≥ 20）、`npm`、`unzip` 是否就绪，CPU 架构是否为 amd64/arm64，磁盘可用空间是否足够；Shell 安装还会检查系统包管理器与 root/sudo 权限，Docker 安装还会检查 Docker 守护进程与 Compose 插件。任一项不满足会一次性列出全部问题并取消安装，处理后再选一次即可。
+**默认版子菜单**（只管农场，不碰 NapCat）：`1` 源码后台启动、`2` Docker 启动、`3` 停止源码服务、`4` 重启源码服务、`5` 停止 Docker 服务、`6` 重启 Docker 服务、`0` 返回上级。源码启动时源码有改动才重新构建 Web/Core，然后后台运行 `node core/client.js`。
+
+**自动配置版子菜单**：`1` / `2` 分别是源码 / Docker 的「启动 + 全自动安装配置 NapCat」首次流程；`3`–`5` 是整套服务（农场 + 授权服务 + NapCat）在源码模式下的启动 / 停止 / 重启；`6`–`8` 是整套服务在 Docker 模式下的启动 / 停止 / 重启；`0` 返回上级。「整套」的启停会一起处理农场、qq-miniapp-auth 和 NapCat；日常如果只是想启停农场（不动 NapCat），用默认版子菜单即可。农场面板与默认版一样在后台启动，即使 NapCat 的 QQ 登录暂时没就绪，面板也照常可访问。
+
+自动配置版开始安装前，脚本会先做一次环境预检：检查 `curl`、`tar`、`node`（要求 Node.js ≥ 20）、`npm`、`unzip` 是否就绪，CPU 架构是否为 amd64/arm64，磁盘可用空间是否足够；Shell 安装还会检查系统包管理器与 root/sudo 权限，Docker 安装还会检查 Docker 守护进程与 Compose 插件。任一项不满足会一次性列出全部问题并取消安装，处理后再进子菜单重选一次即可。
 
 启动完成后脚本会打印面板地址（本机 IP + 端口，能取到公网 IP 时额外打印一行），首次启动还会打印管理员账号和密码；之后再启动只打印地址，重置密码时再打印账号和新密码。
 
-选项 `7` 用于 QQ 扫码登录页面一直提示「工作流繁忙」「刷新二维码没反应」的情况：它会读授权服务的 `/api/health` 显示当前是否有登录卡住，然后重启 qq-miniapp-auth（内存里的单例登录工作流随之清空），并让 NapCat 重启登录 worker，之后回面板重新点「刷新二维码」即可。正常情况下不需要手动用它——面板在刷新二维码时会先释放上一个任务再建新任务。
+NapCat 管理子菜单里的「修复 QQ 扫码登录」用于面板一直提示「工作流繁忙」「刷新二维码没反应」的情况：它会读授权服务的 `/api/health` 显示当前是否有登录卡住，然后重启 qq-miniapp-auth（内存里的单例登录工作流随之清空），并让 NapCat 重启登录 worker，之后回面板重新点「刷新二维码」即可。正常情况下不需要手动用它——面板在刷新二维码时会先释放上一个任务再建新任务。
 
-qq-miniapp-auth 是否已启动以 `/api/health` 是否返回 200 为准，不只看 PID 文件：`npm start` 会多套一层 node 子进程，父进程退出后子进程仍可能占着 8787/9010，重复启动会报 `EADDRINUSE`。脚本启动前会先探测健康端点， unhealthy 时清掉本目录下残留的服务进程再启动。若手动重启后仍报端口被占，可先执行 `pkill -f 'qq-miniapp-auth/(bridge|server|start-all)\.js'` 清理，再选 `3` / `4` 或选项 `7`。
+qq-miniapp-auth 是否已启动以 `/api/health` 是否返回 200 为准，不只看 PID 文件：`npm start` 会多套一层 node 子进程，父进程退出后子进程仍可能占着 8787/9010，重复启动会报 `EADDRINUSE`。脚本启动前会先探测健康端点， unhealthy 时清掉本目录下残留的服务进程再启动。若手动重启后仍报端口被占，可先执行 `pkill -f 'qq-miniapp-auth/(bridge|server|start-all)\.js'` 清理，再进自动配置版子菜单或 NapCat 管理里的「修复 QQ 扫码登录」。
 
 **NapCat 版本固定跟随上游 [BUGDey/qq-farm-bot](https://github.com/BUGDey/qq-farm-bot) 的 `v4.18.19`**，可用 `NAPCAT_VERSION` 覆盖。
 

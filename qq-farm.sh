@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-17.3"
+SCRIPT_VERSION="2026-11-17.5"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -1609,56 +1609,218 @@ fs.renameSync(path + ".tmp", path);
 
 # ---------------------------------------------------------------- 菜单
 
+# ---------------------------------------------------------------- 服务组控制（供子菜单调用）
+
+# 停止 Docker 农场（复用 compose 探测，只 stop 不删容器）
+compose_stop(){
+  need docker
+  local -a cmd=()
+  if docker compose version >/dev/null 2>&1; then
+    cmd=(docker compose)
+  elif command -v docker-compose >/dev/null 2>&1; then
+    cmd=(docker-compose)
+  else
+    die '未安装 Docker Compose（apt install docker-compose-plugin / dnf install docker-compose-plugin）'
+  fi
+  ( cd "$PROJECT_DIR" && "${cmd[@]}" -f "$COMPOSE_FILE" stop )
+}
+
+# 农场服务：只启停农场本身，不碰 NapCat / 授权服务
+start_farm(){
+  local mode="${1:-source}"
+  if [[ "$mode" == 'docker' ]]; then start_docker; else start_source; fi
+}
+
+stop_farm(){
+  local mode="${1:-source}"
+  need_project
+  if [[ "$mode" == 'docker' ]]; then
+    need docker
+    docker info >/dev/null 2>&1 || die 'Docker 未运行或当前用户无权访问 Docker'
+    compose_stop
+    ok '农场 Docker 已停止'
+  else
+    if [[ -f "$SOURCE_PID" ]]; then
+      local pid
+      pid="$(tr -d '[:space:]' < "$SOURCE_PID" 2>/dev/null || true)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+      rm -f "$SOURCE_PID"
+    fi
+    ok '农场源码服务已停止'
+  fi
+}
+
+restart_farm(){
+  local mode="${1:-source}"
+  stop_farm "$mode"
+  sleep 2
+  start_farm "$mode"
+}
+
+# 整套服务：农场 + 授权服务 + NapCat
+start_stack(){
+  local mode="${1:-source}"
+  start_farm "$mode"
+  start_auth_service
+  start_napcat
+}
+
+stop_stack(){
+  local mode="${1:-source}"
+  stop_farm "$mode"
+  stop_napcat
+  stop_auth_service
+  ok '整套服务已停止'
+}
+
+restart_stack(){
+  local mode="${1:-source}"
+  stop_stack "$mode"
+  sleep 2
+  start_stack "$mode"
+}
+
+# 完整安装配置流程（首次用）：源码模式
+auto_install_shell(){
+  if ! preflight_install shell; then
+    warn '环境检查未通过，已取消安装，请处理后重试'
+    return 1
+  fi
+  read_settings
+  install_napcat_shell
+  install_auth_service
+  install_napcat_plugin
+  configure_napcat
+  configure_source
+  # 农场服务按默认版的方式后台启动；先起农场，再拉起 NapCat/授权服务。
+  # 这样即使 NapCat 的 QQ 登录暂时没就绪，面板也已经在后台运行。
+  start_source
+  start_auth_service
+  start_napcat
+}
+
+# 完整安装配置流程（首次用）：Docker 模式
+auto_install_docker(){
+  if ! preflight_install docker; then
+    warn '环境检查未通过，已取消安装，请处理后重试'
+    return 1
+  fi
+  read_settings
+  install_napcat_docker
+  install_auth_service
+  install_napcat_plugin
+  configure_napcat
+  start_docker 1
+  configure_docker
+  start_auth_service
+  start_napcat
+  if creds_shown; then
+    report_panel_access 0
+  else
+    report_panel_access 1 admin admin
+    mark_creds_shown
+  fi
+}
+
+# -------- 二级菜单：默认版（只启动农场，不碰 NapCat）
+
+menu_default(){
+  while true; do
+    printf '\n---- 默认版（只启动农场，不碰 NapCat）----\n'
+    printf '1. 源码后台启动\n'
+    printf '2. Docker 启动\n'
+    printf '3. 停止源码服务\n'
+    printf '4. 重启源码服务\n'
+    printf '5. 停止 Docker 服务\n'
+    printf '6. 重启 Docker 服务\n'
+    printf '0. 返回上级\n'
+    read -r -p '请选择：' c
+    case "$c" in
+      1) start_source;;
+      2) start_docker;;
+      3) stop_farm source;;
+      4) restart_farm source;;
+      5) stop_farm docker;;
+      6) restart_farm docker;;
+      0) return 0;;
+      *) warn '无效选项';;
+    esac
+    read -r -p '按回车继续…' _
+  done
+}
+
+# -------- 二级菜单：自动配置版（自动安装并配置 NapCat 与 qq-miniapp-auth）
+
+menu_auto(){
+  while true; do
+    printf '\n---- 自动配置版（自动安装并配置 NapCat 与 qq-miniapp-auth）----\n'
+    printf '1. 源码启动 + 全自动安装配置 NapCat（Shell 安装，不使用 Docker）\n'
+    printf '2. Docker 启动 + 全自动安装配置 NapCat（Docker 安装）\n'
+    printf '3. 启动整套（源码）\n'
+    printf '4. 停止整套（源码）\n'
+    printf '5. 重启整套（源码）\n'
+    printf '6. 启动整套（Docker）\n'
+    printf '7. 停止整套（Docker）\n'
+    printf '8. 重启整套（Docker）\n'
+    printf '0. 返回上级\n'
+    read -r -p '请选择：' c
+    case "$c" in
+      1) auto_install_shell;;
+      2) auto_install_docker;;
+      3) start_stack source;;
+      4) stop_stack source;;
+      5) restart_stack source;;
+      6) start_stack docker;;
+      7) stop_stack docker;;
+      8) restart_stack docker;;
+      0) return 0;;
+      *) warn '无效选项';;
+    esac
+    read -r -p '按回车继续…' _
+  done
+}
+
+# -------- 二级菜单：NapCat 管理（启动 / 停止 / 重启 / 修复 QQ 扫码）
+
+menu_napcat(){
+  while true; do
+    printf '\n---- NapCat 管理 ----\n'
+    printf '1. 启动 NapCat\n'
+    printf '2. 停止 NapCat\n'
+    printf '3. 重启 NapCat\n'
+    printf '4. 修复 QQ 扫码登录（重置卡住的登录状态）\n'
+    printf '0. 返回上级\n'
+    read -r -p '请选择：' c
+    case "$c" in
+      1) start_napcat;;
+      2) stop_napcat;;
+      3) restart_napcat;;
+      4) fix_qq_login;;
+      0) return 0;;
+      *) warn '无效选项';;
+    esac
+    read -r -p '按回车继续…' _
+  done
+}
+
 menu(){
   while true; do
     printf '\n==== QQ Farm Bot + NapCat（脚本版本 %s）====\n' "$SCRIPT_VERSION"
-    printf '1. 源码后台启动\n'
-    printf '2. Docker 启动\n'
-    printf '3. 源码启动并全自动安装/配置 NapCat（Shell 安装，不使用 Docker）与 qq-miniapp-auth\n'
-    printf '4. Docker 启动并全自动安装/配置 NapCat（Docker 安装）与 qq-miniapp-auth\n'
-    printf '5. 重启 NapCat\n'
+    printf '1. 默认版（选择后里面再选择源码启动还是 Docker）\n'
+    printf '2. 自动配置版（同样选择后再选择源码还是 Docker）\n'
+    printf '5. NapCat 管理（包含启动 / 停止 / 重启 / 修复 QQ 扫码）\n'
     printf '6. 重置管理员密码\n'
-    printf '7. 修复 QQ 扫码登录（重置卡住的登录状态）\n'
     printf '0. 退出\n'
     read -r -p '请选择：' choice
     case "$choice" in
-      1) start_source;;
-      2) start_docker;;
-      3)
-        preflight_install shell || { warn '环境检查未通过，已取消安装，请处理后重试'; continue; }
-        read_settings
-        install_napcat_shell
-        install_auth_service
-        install_napcat_plugin
-        configure_napcat
-        configure_source
-        # 农场服务按选项 1 的方式后台启动；先起农场，再拉起 NapCat/授权服务。
-        # 这样即使 NapCat 的 QQ 登录暂时没就绪，面板也已经在后台运行。
-        start_source
-        start_auth_service
-        start_napcat
-        ;;
-      4)
-        preflight_install docker || { warn '环境检查未通过，已取消安装，请处理后重试'; continue; }
-        read_settings
-        install_napcat_docker
-        install_auth_service
-        install_napcat_plugin
-        configure_napcat
-        start_docker 1
-        configure_docker
-        start_auth_service
-        start_napcat
-        if creds_shown; then
-          report_panel_access 0
-        else
-          report_panel_access 1 admin admin
-          mark_creds_shown
-        fi
-        ;;
-      5) restart_napcat;;
+      1) menu_default; continue;;
+      2) menu_auto; continue;;
+      5) menu_napcat; continue;;
       6) reset_admin;;
-      7) fix_qq_login;;
       0) exit 0;;
       *) warn '无效选项';;
     esac
