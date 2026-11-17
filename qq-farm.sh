@@ -1760,12 +1760,12 @@ menu_auto(){
     printf '\n---- 自动配置版（自动安装并配置 NapCat 与 qq-miniapp-auth）----\n'
     printf '1. 源码启动 + 全自动安装配置 NapCat（Shell 安装，不使用 Docker）\n'
     printf '2. Docker 启动 + 全自动安装配置 NapCat（Docker 安装）\n'
-    printf '3. 启动整套（源码）\n'
-    printf '4. 停止整套（源码）\n'
-    printf '5. 重启整套（源码）\n'
-    printf '6. 启动整套（Docker）\n'
-    printf '7. 停止整套（Docker）\n'
-    printf '8. 重启整套（Docker）\n'
+    printf '3. 启动源码\n'
+    printf '4. 停止源码\n'
+    printf '5. 重启源码\n'
+    printf '6. Docker启动\n'
+    printf '7. 停止Docker\n'
+    printf '8. 重启Docker\n'
     printf '0. 返回上级\n'
     read -r -p '请选择：' c
     case "$c" in
@@ -1809,10 +1809,10 @@ menu_napcat(){
 
 menu(){
   while true; do
-    printf '\n==== QQ Farm Bot + NapCat（脚本版本 %s）====\n' "$SCRIPT_VERSION"
-    printf '1. 默认版（选择后里面再选择源码启动还是 Docker）\n'
-    printf '2. 自动配置版（同样选择后再选择源码还是 Docker）\n'
-    printf '5. NapCat 管理（包含启动 / 停止 / 重启 / 修复 QQ 扫码）\n'
+    printf '\n==== QQ Farm Bot + NapCat ====\n'
+    printf '1. 默认版\n'
+    printf '2. 自动配置版\n'
+    printf '5. NapCat 管理\n'
     printf '6. 重置管理员密码\n'
     printf '0. 退出\n'
     read -r -p '请选择：' choice
