@@ -34,7 +34,7 @@ AUTH_DIR="$ROOT_DIR/qq-miniapp-auth"
 # 源码包地址默认由 auth_tarball_urls() 生成（多源 + 加速前缀），这里只作为用户手动覆盖
 AUTH_TARBALL_URL="${AUTH_TARBALL_URL:-}"
 STATE_FILE="$NAPCAT_DIR/manager-config.env"
-SCRIPT_VERSION="2026-11-17.7"
+SCRIPT_VERSION="2026-11-17.8"
 TMPDIR="${TMPDIR:-/tmp}"
 FARM_DATA="$PROJECT_DIR/core/data"
 FARM_STORE="$FARM_DATA/store.json"
@@ -703,33 +703,71 @@ napcat_installed(){
   esac
 }
 
-# 列出当前在跑的 NapCat QQ 进程（xvfb-run 父进程与 qq 子进程都会命中）。
-# 重装或异常退出会留下多组进程；多实例竞争时只有持登录态的那个加载 OneBot 配置，
-# 另一个不监听 3000，二维码接口就会失败。启动前据此清理，保证只有一个实例。
+# 列出 NapCat QQ 主进程（xvfb-run 包装进程 + qq 主进程），已去重。
+# 关键：QQ 基于 Chromium，会 fork 一堆 --type=renderer/gpu/utility/zygote 子进程，
+# 它们不是"第二个实例"，杀掉只会让主进程崩溃重启，必须排除。
 napcat_running_pids(){
   local p cmd
-  for p in $(pgrep -f 'Napcat/opt/QQ/qq|app_launcher/napcat' 2>/dev/null || true); do
+  for p in $(pgrep -f 'Napcat/opt/QQ/qq|/opt/QQ/qq' 2>/dev/null || true); do
     [[ "$p" == "$$" ]] && continue
     cmd="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)"
+    [[ -z "$cmd" ]] && continue
+    [[ "$cmd" == *--type=* ]] && continue
     case "$cmd" in
-      *"Napcat/opt/QQ/qq"*|*"app_launcher/napcat"*) printf '%s\n' "$p" ;;
+      *"Napcat/opt/QQ/qq"*|*"/opt/QQ/qq"*) printf '%s\n' "$p" ;;
     esac
   done | sort -u
 }
 
-kill_napcat_pids(){
-  local pids="$1" p
-  [[ -n "$pids" ]] || return 0
-  while IFS= read -r p; do
-    [[ -n "$p" ]] || continue
-    kill -TERM "$p" 2>/dev/null || true
-  done <<< "$pids"
-  sleep 2
-  while IFS= read -r p; do
-    [[ -n "$p" ]] || continue
-    kill -9 "$p" 2>/dev/null || true
-  done <<< "$pids"
+# PID 文件里的进程是否真的是 NapCat：不能只看 kill -0（过期 PID 可能被别的进程复用）。
+napcat_pid_alive(){
+  local pid="$1" cmd
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$cmd" in
+    *"Napcat/opt/QQ/qq"*|*"/opt/QQ/qq"*|*xvfb-run*) return 0 ;;
+  esac
+  return 1
 }
+
+# 等待这些 PID 全部消失，最多 10 秒。
+napcat_wait_gone(){
+  local pids="$1" p i any
+  for ((i=0; i<10; i++)); do
+    any=0
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && { any=1; break; }
+    done <<< "$pids"
+    [[ "$any" -eq 0 ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# 彻底结束所有 NapCat QQ 进程：先 TERM 主进程并确认退出；不退再 KILL；仍不退返回失败。
+napcat_kill_all(){
+  local pids; pids="$(napcat_running_pids)"
+  if [[ -z "$pids" ]]; then
+    rm -f "$NAPCAT_PID"
+    return 0
+  fi
+  info "正在结束 NapCat 进程：$(printf '%s' "$pids" | tr '\n' ' ')"
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && kill -TERM "$p" 2>/dev/null || true
+  done <<< "$pids"
+  if napcat_wait_gone "$pids"; then rm -f "$NAPCAT_PID"; return 0; fi
+  warn 'TERM 后进程仍在，强制结束…'
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && kill -9 "$p" 2>/dev/null || true
+  done <<< "$pids"
+  if napcat_wait_gone "$pids"; then rm -f "$NAPCAT_PID"; return 0; fi
+  return 1
+}
+
+# 兼容旧调用点。
+kill_napcat_pids(){ napcat_kill_all; }
 
 cd_home(){ cd "$HOME" || die "无法进入 $HOME"; }
 
@@ -1095,6 +1133,37 @@ restart_auth_service(){
   start_auth_service
 }
 
+# NapCat 未登录时 OneBot(3000) 不会监听，二维码应从 cache/qrcode.png 文件读取。
+# 把该文件路径写进授权服务的 NAPCAT_QR_IMAGE_PATH，前端才不会只显示"二维码不可用"。
+write_qr_image_path(){
+  [[ -f "$AUTH_DIR/.env" ]] || return 1
+  local root qr
+  root="${NAPCAT_ROOT:-}"
+  [[ -n "$root" ]] || root="$(napcat_detect_root 2>/dev/null || true)"
+  [[ -n "$root" ]] || root="$HOME/Napcat/opt/QQ/resources/app/app_launcher/napcat"
+  qr="$root/cache/qrcode.png"
+  local changed
+  changed="$(node -e '
+const fs=require("fs");
+const [path,qr]=process.argv.slice(1);
+let s=fs.existsSync(path)?fs.readFileSync(path,"utf8"):"";
+const line="NAPCAT_QR_IMAGE_PATH="+qr;
+const re=/^NAPCAT_QR_IMAGE_PATH=.*$/m;
+if(re.test(s)){
+  if(s.match(re)[0]===line){process.stdout.write("no");}
+  else{s=s.replace(re,line);fs.writeFileSync(path,s);process.stdout.write("yes");}
+}else{
+  s+=(s===""||s.endsWith("\n")?"":"\n")+line+"\n";fs.writeFileSync(path,s);process.stdout.write("yes");
+}
+' "$AUTH_DIR/.env" "$qr" 2>/dev/null || true)"
+  if [[ "$changed" == 'yes' ]]; then
+    chmod 600 "$AUTH_DIR/.env" 2>/dev/null || true
+    ok "NapCat 二维码文件路径已写入授权服务：$qr"
+    return 0
+  fi
+  return 1
+}
+
 # QQ 扫码登录卡在「工作流繁忙」时，内存里的单例工作流没释放，只能重启授权服务。
 # NapCat 侧还会残留 WebUI 的 QQLoginStatus 标志，一并让它重启 worker。
 fix_qq_login(){
@@ -1330,6 +1399,11 @@ configure_napcat(){
   done
   ok "NapCat OneBot HTTP 服务已配置：$([[ "${NAPCAT_MODE:-}" == 'docker' ]] && echo 0.0.0.0 || echo 127.0.0.1):$ONEBOT_PORT"
   info "qq-miniapp-auth API 地址：$API_ENDPOINT"
+  # 二维码文件兜底：NapCat 未登录时 OneBot(3000) 不监听，二维码从 cache/qrcode.png 读。
+  # 路径变化时重启授权服务，让新的 NAPCAT_QR_IMAGE_PATH 生效。
+  if [[ "${NAPCAT_MODE:-}" != 'docker' ]]; then
+    if write_qr_image_path; then restart_auth_service; fi
+  fi
   if [[ "${NAPCAT_MODE:-}" == 'docker' ]]; then
     docker restart "$NAPCAT_CONTAINER" >/dev/null 2>&1 || warn 'NapCat 容器重启失败，请手动执行 docker restart'
     sleep 3
@@ -1396,23 +1470,23 @@ start_napcat(){
   qq="$(napcat_detect_qq || true)"
   [[ -n "$qq" ]] || die "未找到 QQ 可执行文件（$HOME/Napcat/opt/QQ/qq 或 /opt/QQ/qq）"
 
-  # 只要 OneBot 端口已经在监听，说明 NapCat 已带配置正常运行，直接复用，不再拉起第二个实例
+  # 即使复用已有实例，也先同步二维码文件路径。
+  if write_qr_image_path; then restart_auth_service; fi
+  # OneBot 已监听时复用现有服务。
   if onebot_listening; then
     ok "NapCat 的 OneBot 服务已在监听 $ONEBOT_PORT，跳过重复启动"
     return 0
   fi
 
-  # 清理残留的 NapCat QQ 进程：多实例竞争会导致只有一个加载 OneBot 配置，
-  # 另一个不监听 3000，二维码接口取不到数据。启动前保证从单实例开始。
-  local stale; stale="$(napcat_running_pids)"
-  if [[ -n "$stale" ]]; then
-    warn '检测到残留的 NapCat QQ 进程，先结束它们，保证只有一个实例加载配置'
-    kill_napcat_pids "$stale"
+  # 关键：走到这里说明 OneBot 端口没监听。PID 文件里的进程可能还在，但配置没加载，
+  # 不能像以前那样"PID 活着就 return"——那会让脚本永远拉不起真正工作的实例。
+  # 必须先彻底清掉所有旧实例（含多实例竞争），确认它们真的退出，再拉起唯一实例。
+  if ! napcat_kill_all; then
+    die '旧的 NapCat 进程无法结束，已停止启动以避免多实例竞争；请手动 kill 后重试'
   fi
-  if [[ -f "$NAPCAT_PID" ]] && kill -0 "$(cat "$NAPCAT_PID" 2>/dev/null || echo 0)" 2>/dev/null; then
-    ok "NapCat 已在运行，PID $(cat "$NAPCAT_PID")"
-    return 0
-  fi
+  rm -f "$NAPCAT_PID"
+  # 二维码文件兜底路径：未登录阶段 OneBot 不监听，前端靠 cache/qrcode.png 取码。
+  if write_qr_image_path; then restart_auth_service; fi
   if ! command -v xvfb-run >/dev/null 2>&1; then
     warn '未安装 xvfb-run，尝试安装…'
     install_pkgs xvfb >/dev/null 2>&1 || install_pkgs xorg-x11-server-Xvfb >/dev/null 2>&1 || true
@@ -1456,9 +1530,11 @@ start_napcat(){
   if onebot_listening; then
     ok "NapCat OneBot HTTP 服务已在监听 $ONEBOT_PORT"
   else
-    warn "NapCat 进程已起，但 OneBot 端口 $ONEBOT_PORT 尚未监听：通常需要在 WebUI 扫码登录 QQ 后才会加载配置；请打开 WebUI 完成登录：http://127.0.0.1:6099/webui/"
+    # QQ 未登录阶段 OneBot 端口本来就不会监听，二维码走 cache/qrcode.png 文件，
+    # 前端应能正常显示二维码；扫码登录成功后 3000 会自动起来。
+    warn "NapCat OneBot 端口 $ONEBOT_PORT 尚未监听（未登录时属正常）；二维码将从 cache/qrcode.png 读取，请到面板扫码"
   fi
-  info '打开 NapCat WebUI 扫码登录 QQ：http://127.0.0.1:6099/webui/'
+  info '若面板二维码仍不可用，先运行菜单 5 → 3 重启 NapCat，再运行 5 → 4 修复扫码登录'
 }
 
 stop_napcat(){
@@ -1468,25 +1544,18 @@ stop_napcat(){
     ok "NapCat 容器已停止：$NAPCAT_CONTAINER"
     return 0
   fi
-  local pid=''
-  if [[ -f "$NAPCAT_PID" ]]; then
-    pid="$(tr -d '[:space:]' < "$NAPCAT_PID" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      sleep 1
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -f "$NAPCAT_PID"
+  # 用统一的彻底清理：确认所有 NapCat QQ 进程真的消失，否则返回失败
+  if ! napcat_kill_all; then
+    warn '部分 NapCat 进程未能结束，请手动检查：ps aux | grep -i napcat'
+    return 1
   fi
-  # 只结束本脚本拉起的 NapCat（rootless 安装路径），不做全局 pkill
-  pkill -f "Napcat/opt/QQ/qq" 2>/dev/null || true
-  sleep 1
   ok 'NapCat 已停止'
 }
 
 restart_napcat(){
   info '正在重启 NapCat…'
-  stop_napcat || true
+  # 停止失败就不继续启动，否则又会造出多实例竞争
+  stop_napcat || die '旧 NapCat 未能停止，已取消重启'
   sleep 2
   start_napcat
 }
